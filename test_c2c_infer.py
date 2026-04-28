@@ -25,7 +25,7 @@ rosetta_model, tokenizer = load_rosetta_model(
 
 device = rosetta_model.device
 #Agent prompt here
-prompt = [{"role": "user", "content": "Say hello in one short sentence."}]
+prompt = [{"role": "user", "content": "A boat is acted on by a river current flowing north and by wind blowing on its sails. The boat travels northeast. In which direction is the wind most likely applying force to the sails of the boat?"}]
 input_text = tokenizer.apply_chat_template(
     prompt,
     tokenize=False,
