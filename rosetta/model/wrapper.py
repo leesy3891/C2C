@@ -74,6 +74,34 @@ class RosettaModel(nn.Module):
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
         self.multi_source_fusion_mode = multi_source_fusion_mode
 
+        # Cache analysis (optional, set via set_cache_analysis_collector)
+        self._cache_analysis_collector = None
+        self._cache_analysis_context: dict = {}  # transient per-forward metadata
+
+    def set_cache_analysis_collector(self, collector):
+        """Attach a CacheAnalysisCollector for key-cache diagnostics."""
+        self._cache_analysis_collector = collector
+
+    def set_cache_analysis_context(self, **kwargs):
+        """Set transient metadata (model_type, subject, question_id, stage) for the next forward."""
+        self._cache_analysis_context = kwargs
+
+    def _ca_record(self, cache_name: str, layer_idx: int, key_cache: torch.Tensor):
+        """Convenience: record a key-cache snapshot if collector is active."""
+        c = self._cache_analysis_collector
+        if c is None or not c.enabled:
+            return
+        ctx = self._cache_analysis_context
+        c.record(
+            model_type=ctx.get("model_type", "rosetta"),
+            subject=ctx.get("subject", ""),
+            question_id=ctx.get("question_id", -1),
+            stage=ctx.get("stage", "prefill"),
+            cache_name=cache_name,
+            layer_idx=layer_idx,
+            key_cache=key_cache,
+        )
+
     @property
     def device(self):
         return self.model_list[self.base_model_idx].device
@@ -331,6 +359,13 @@ class RosettaModel(nn.Module):
             fused_kv_cache.key_cache[target_layer_idx][:, :, -new_length:, :] = agg_key
             fused_kv_cache.value_cache[target_layer_idx][:, :, -new_length:, :] = agg_value
 
+            # --- Cache analysis: record receiver, sharer, fused for include_response path ---
+            if self._cache_analysis_collector is not None and self._cache_analysis_collector.enabled:
+                self._ca_record("receiver", target_layer_idx, new_base_kv_cache[0].clone())
+                self._ca_record("sharer", target_layer_idx, agg_key.clone())
+                self._ca_record("fused", target_layer_idx,
+                                fused_kv_cache.key_cache[target_layer_idx][:, :, -new_length:, :].clone())
+
         # Monkeypatch attention forward so the modified KV is used in *this* forward pass.
         hook_handlers = []  # list of (attn_module, orig_forward)
         for i in range(self.model_list[self.base_model_idx].config.num_hidden_layers):
@@ -554,6 +589,11 @@ class RosettaModel(nn.Module):
                                 # Use first projector result
                                 agg_key, agg_value = projected_kv_list[0]
 
+                                # --- Cache analysis: record receiver & sharer before fusion ---
+                                if self._cache_analysis_collector is not None and self._cache_analysis_collector.enabled:
+                                    self._ca_record("receiver", target_layer_idx, new_base_key_cache.clone())
+                                    self._ca_record("sharer", target_layer_idx, agg_key.clone())
+
                                 # Collect or apply projection based on mode
                                 if self.multi_source_fusion_mode == "sequential":
                                     # Sequential: apply immediately so next source sees updated cache
@@ -579,6 +619,13 @@ class RosettaModel(nn.Module):
                                 base_value_slice = base_value_cache[:, :, start:end, :]
                                 curr_base_kv_cache.key_cache[target_layer_idx][:, :, start:end, :] = base_key_slice + delta_key
                                 curr_base_kv_cache.value_cache[target_layer_idx][:, :, start:end, :] = base_value_slice + delta_value
+
+                        # --- Cache analysis: record fused cache for all projected layers ---
+                        if self._cache_analysis_collector is not None and self._cache_analysis_collector.enabled:
+                            for source_model_idx_ca in self.projector_dict[self.base_model_idx].keys():
+                                for t_layer_idx_ca in self.projector_dict[self.base_model_idx][source_model_idx_ca].keys():
+                                    fused_key = curr_base_kv_cache.key_cache[t_layer_idx_ca][:, :, start:end, :].clone()
+                                    self._ca_record("fused", t_layer_idx_ca, fused_key)
 
                 output.past_key_values = curr_base_kv_cache
                                                                              
