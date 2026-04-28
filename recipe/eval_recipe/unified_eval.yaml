@@ -32,12 +32,42 @@ output:
 
 eval:
   dataset: mmlu-redux
-  gpu_ids: [0]  # GPUs to use for evaluation
+  # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
+  # Example: CUDA_VISIBLE_DEVICES=2,3 + gpu_ids: [0,1] => physical GPU 2 and 3.
+  # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
+  gpu_ids: [0]
   answer_method: generate  # 'generate' or 'logits'
   use_cot: false  # Enable chain-of-thought reasoning
   use_template: true
   sample_interval: 1  # Sample every N examples
-  # limit:   # Limit examples per subject (null for all)
+  # limit:   # Limit examples per subject (null for all) — backward compatible
   # subjects: ["nutrition"] # Optional: specify specific subjects to evaluate
   # response_text: ""
   math_grading_method: "comprehensive"
+
+  # ── Dataset slicing (new) ──────────────────────────────────────────
+  # start_index: first sample index to evaluate (default 0)
+  # num_of_tasks: how many samples from start_index (null = until end)
+  # Applied BEFORE virtual split (multi-GPU) and BEFORE legacy limit.
+  start_index: 0
+  num_of_tasks: null
+
+  # ── Cache analysis (new) ───────────────────────────────────────────
+  cache_analysis:
+    enabled: false          # Set to true to activate key-cache diagnostics
+    target: key             # Only "key" is supported
+
+    # --- Entropy settings (logit-lens based) ---
+    entropy_space: logit_lens
+    logit_lens_temperature: 1.0
+
+    # --- KL divergence settings (raw key-cache magnitude distribution) ---
+    kl_space: raw_key_cache
+    kl_vector_align: last   # "last" or "first" — how to align vectors of different lengths
+
+    # --- General ---
+    save_raw_cache: false            # Save per-sample per-layer .pt tensors (large!)
+    max_pca_points_per_layer: 2000   # Max points per cache_name in PCA scatter
+    pca_sample_seed: 42
+    entropy_eps: 1.0e-12
+    kl_eps: 1.0e-12
