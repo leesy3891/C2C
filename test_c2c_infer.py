@@ -4,14 +4,16 @@ from script.playground.inference_example import load_rosetta_model
 
 checkpoint_dir = snapshot_download(
     repo_id="nics-efc/C2C_Fuser",
-    allow_patterns=["qwen3_0.6b+qwen2.5_0.5b_Fuser/*"],
+    allow_patterns=["qwen3_8b+qwen2.5_7b_Fuser/*"],
 )
+
+# https://huggingface.co/nics-efc/C2C_Fuser/tree/main/qwen3_8b+qwen2.5_7b_Fuser
 
 model_config = {
     "rosetta_config": {
-        "base_model": "Qwen/Qwen3-0.6B",
-        "teacher_model": "Qwen/Qwen2.5-0.5B-Instruct",
-        "checkpoints_dir": f"{checkpoint_dir}/qwen3_0.6b+qwen2.5_0.5b_Fuser/final",
+        "base_model": "Qwen/Qwen3-8B",
+        "teacher_model": "Qwen/Qwen2.5-7B-Instruct",
+        "checkpoints_dir": f"{checkpoint_dir}/qwen3_8b+qwen2.5_7b_Fuser/final",
     }
 }
 
@@ -22,6 +24,7 @@ rosetta_model, tokenizer = load_rosetta_model(
 )
 
 device = rosetta_model.device
+#Agent prompt here
 prompt = [{"role": "user", "content": "Say hello in one short sentence."}]
 input_text = tokenizer.apply_chat_template(
     prompt,
@@ -42,7 +45,7 @@ with torch.no_grad():
         **inputs,
         kv_cache_index=kv_cache_index,
         do_sample=False,
-        max_new_tokens=64,
+        max_new_tokens=1024,
     )
     output_text = tokenizer.decode(
         outputs[0, instruction_index.shape[1] + 1:],
