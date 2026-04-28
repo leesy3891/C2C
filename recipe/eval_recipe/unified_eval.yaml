@@ -50,7 +50,7 @@ eval:
   # num_of_tasks: how many samples from start_index (null = until end)
   # Applied BEFORE virtual split (multi-GPU) and BEFORE legacy limit.
   start_index: 0
-  num_of_tasks: null
+  num_of_tasks: 50
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
