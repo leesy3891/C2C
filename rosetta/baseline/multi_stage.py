@@ -49,7 +49,45 @@ class TwoStageInference:
         self.max_new_tokens = max_new_tokens
         self.background_prompt = background_prompt
         self.generation_config = generation_config or {}
+        self._cache_analysis_collector = None
+        self._cache_analysis_context: dict = {}
         self._load_models(context_model_path, answer_model_path)
+
+    def set_cache_analysis_collector(self, collector):
+        """Attach a CacheAnalysisCollector."""
+        self._cache_analysis_collector = collector
+
+    def set_cache_analysis_context(self, **kwargs):
+        """Set transient metadata for next forward (subject, question_id, etc.)."""
+        self._cache_analysis_context = kwargs
+
+    def _ca_collect_key_cache(self, model, tokenizer, text: str, cache_name: str, stage: str):
+        """Run a prefill forward to collect layerwise key caches for analysis."""
+        c = self._cache_analysis_collector
+        if c is None or not c.enabled:
+            return
+        ctx = self._cache_analysis_context
+
+        inputs = tokenizer(text, return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            out = model(**inputs, use_cache=True)
+            kv = out.past_key_values
+            if kv is not None:
+                num_layers = len(kv) if isinstance(kv, (list, tuple)) else len(kv.key_cache)
+                for layer_idx in range(num_layers):
+                    if isinstance(kv, (list, tuple)):
+                        key_cache = kv[layer_idx][0]
+                    else:
+                        key_cache = kv.key_cache[layer_idx]
+                    c.record(
+                        model_type=ctx.get("model_type", "two_stage"),
+                        subject=ctx.get("subject", ""),
+                        question_id=ctx.get("question_id", -1),
+                        stage=stage,
+                        cache_name=cache_name,
+                        layer_idx=layer_idx,
+                        key_cache=key_cache,
+                    )
     
     def _load_models(self, context_path: str, answer_path: str):
         """Load both LLM models."""
@@ -119,6 +157,16 @@ class TwoStageInference:
         context = self.context_tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+
+        # --- Cache analysis: collect context model (stage1) key cache ---
+        if self._cache_analysis_collector is not None and self._cache_analysis_collector.enabled:
+            prompt_text = self.context_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs
+            )
+            self._ca_collect_key_cache(
+                self.context_model, self.context_tokenizer,
+                prompt_text, cache_name="stage1", stage="two_stage_context"
+            )
         
         return context
     
@@ -177,6 +225,16 @@ class TwoStageInference:
         answer = self.answer_tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+
+        # --- Cache analysis: collect answer model (stage2) key cache ---
+        if self._cache_analysis_collector is not None and self._cache_analysis_collector.enabled:
+            answer_text = self.answer_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs
+            )
+            self._ca_collect_key_cache(
+                self.answer_model, self.answer_tokenizer,
+                answer_text, cache_name="stage2", stage="two_stage_answer"
+            )
         
         return answer
     
@@ -400,6 +458,18 @@ class TwoStageRosetta(TwoStageInference):
         self.rosetta_checkpoint_dir = rosetta_checkpoint_dir
         self.rosetta_subfolder = rosetta_subfolder
         self._load_rosetta_model()
+
+    def set_cache_analysis_collector(self, collector):
+        """Override to also propagate collector to the inner Rosetta model."""
+        self._cache_analysis_collector = collector
+        if hasattr(self, 'rosetta_model') and self.rosetta_model is not None:
+            self.rosetta_model.set_cache_analysis_collector(collector)
+
+    def set_cache_analysis_context(self, **kwargs):
+        """Override to also propagate context to the inner Rosetta model."""
+        self._cache_analysis_context = kwargs
+        if hasattr(self, 'rosetta_model') and self.rosetta_model is not None:
+            self.rosetta_model.set_cache_analysis_context(**kwargs)
     
     def _load_models(self, context_path: str, answer_path: str):
         """
