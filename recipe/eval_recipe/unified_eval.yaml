@@ -54,7 +54,7 @@ eval:
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
-    enabled: false          # Set to true to activate key-cache diagnostics
+    enabled: true          # Set to true to activate key-cache diagnostics
     target: key             # Only "key" is supported
 
     # --- Entropy settings (logit-lens based) ---
@@ -67,7 +67,7 @@ eval:
 
     # --- General ---
     save_raw_cache: false            # Save per-sample per-layer .pt tensors (large!)
-    max_pca_points_per_layer: 2000   # Max points per cache_name in PCA scatter
+    max_pca_points_per_layer: 2500   # Max points per cache_name in PCA scatter
     pca_sample_seed: 42
     entropy_eps: 1.0e-12
     kl_eps: 1.0e-12
