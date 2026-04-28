@@ -46,6 +46,7 @@ from rosetta.train.dataset_adapters import generate_kv_cache_index
 from transformers import AutoTokenizer
 from rosetta.utils.evaluate import set_default_chat_template
 from rosetta.baseline.multi_stage import TwoStageInference, TwoStageRosetta
+from rosetta.utils.cache_analysis import CacheAnalysisCollector
 
 # Dataset-specific configurations
 DATASET_CONFIGS = {
@@ -272,6 +273,15 @@ class UnifiedEvaluator:
         # Debug options
         self.debug_dump_bad_samples = bool(self.eval_config.get("debug_dump_bad_samples", True))
         self.cuda_launch_blocking = bool(self.eval_config.get("cuda_launch_blocking", False))
+
+        # Dataset slicing options
+        self.start_index = int(self.eval_config.get("start_index", 0) or 0)
+        self.num_of_tasks = self.eval_config.get("num_of_tasks", None)
+        if self.num_of_tasks is not None:
+            self.num_of_tasks = int(self.num_of_tasks)
+
+        # Cache analysis config
+        self.cache_analysis_config = self.eval_config.get("cache_analysis", {"enabled": False})
         
         # Check if using two-stage based on model_name
         self.use_two_stage = self.model_config["model_name"].lower() in ["two_stage", "two_stage_rosetta"]
@@ -1081,24 +1091,36 @@ class UnifiedEvaluator:
                
         # Sampling configuration
         sample_interval = self.eval_config.get("sample_interval", 1)
-        sample_indices = list(range(0, len(test_data), sample_interval))
+        start_index = int(self.eval_config.get("start_index", 0) or 0)
+        num_of_tasks = self.eval_config.get("num_of_tasks", None)
+
+        # Compute effective end index
+        total_len = len(test_data)
+        if num_of_tasks is not None:
+            end_index = min(total_len, start_index + int(num_of_tasks))
+        else:
+            end_index = total_len
+
+        sample_indices = list(range(start_index, end_index, sample_interval))
 
         # Apply virtual split window for datasets without native subjects
         if is_virtual_split and total_splits > 1:
-            n = len(test_data)
-            start = (split_index * n) // total_splits
-            end = ((split_index + 1) * n) // total_splits
-            sample_indices = [i for i in sample_indices if start <= i < end]
+            n = len(sample_indices)
+            vs_start = (split_index * n) // total_splits
+            vs_end = ((split_index + 1) * n) // total_splits
+            sample_indices = sample_indices[vs_start:vs_end]
+
+        # Backward-compatible limit (applied AFTER start_index/num_of_tasks)
         limit = self.eval_config.get("limit", None)
         if isinstance(limit, int) and limit > 0:
             # Use first N indices
             sample_indices = sample_indices[:limit]
         elif isinstance(limit, (list, tuple)) and len(limit) == 2:
             # Treat as [start, end) range on original indices
-            start, end = limit
-            start = 0 if start is None else int(start)
-            end = len(test_data) if end is None else int(end)
-            sample_indices = [i for i in sample_indices if start <= i < end]
+            lstart, lend = limit
+            lstart = 0 if lstart is None else int(lstart)
+            lend = len(test_data) if lend is None else int(lend)
+            sample_indices = [i for i in sample_indices if lstart <= i < lend]
         
         for i in tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})"):
             try:
@@ -1140,6 +1162,18 @@ class UnifiedEvaluator:
                     raise ValueError(f"Unknown dataset: {self.dataset_name}")
                 
                 # Generate answer
+                # --- Update cache analysis context with question_id ---
+                if hasattr(model, 'set_cache_analysis_context'):
+                    model.set_cache_analysis_context(
+                        model_type=model_type, subject=subject,
+                        question_id=i, stage="prefill"
+                    )
+                elif isinstance(model, RosettaModel) and model._cache_analysis_collector is not None:
+                    model.set_cache_analysis_context(
+                        model_type=model_type, subject=subject,
+                        question_id=i, stage="prefill"
+                    )
+
                 if model_type in ["two_stage", "two_stage_rosetta"]:
                     # Two-stage inference mode (both regular and Rosetta)
                     # Extract question without options
@@ -1612,8 +1646,67 @@ class UnifiedEvaluator:
         cat_cors = defaultdict(list)
         all_length_stats = []
         cot_logs_all = []
+
+        # --- Cache analysis collector setup ---
+        ca_collector = CacheAnalysisCollector(
+            self.cache_analysis_config, str(self.output_dir), rank=rank
+        )
+        if ca_collector.enabled:
+            # Attach collector to model
+            if model_type == "rosetta" and isinstance(model, RosettaModel):
+                model.set_cache_analysis_collector(ca_collector)
+                # Register lm_head for receiver/sharer/fused entropy
+                base_m = model.model_list[model.base_model_idx]
+                if hasattr(base_m, 'lm_head'):
+                    ca_collector.set_lm_head(
+                        "receiver", base_m.lm_head,
+                        base_m.config.hidden_size, base_m.config.vocab_size
+                    )
+            elif model_type == "two_stage_rosetta" and isinstance(model, TwoStageRosetta):
+                model.set_cache_analysis_collector(ca_collector)
+                # context model lm_head
+                if hasattr(model.context_model, 'lm_head'):
+                    ca_collector.set_lm_head(
+                        "stage1", model.context_model.lm_head,
+                        model.context_model.config.hidden_size,
+                        model.context_model.config.vocab_size
+                    )
+                # rosetta base model lm_head
+                if hasattr(model.rosetta_model, 'model_list'):
+                    base_m = model.rosetta_model.model_list[model.rosetta_model.base_model_idx]
+                    if hasattr(base_m, 'lm_head'):
+                        ca_collector.set_lm_head(
+                            "receiver", base_m.lm_head,
+                            base_m.config.hidden_size, base_m.config.vocab_size
+                        )
+                        ca_collector.set_lm_head(
+                            "stage2", base_m.lm_head,
+                            base_m.config.hidden_size, base_m.config.vocab_size
+                        )
+            elif model_type == "two_stage" and isinstance(model, TwoStageInference):
+                model.set_cache_analysis_collector(ca_collector)
+                if hasattr(model.context_model, 'lm_head'):
+                    ca_collector.set_lm_head(
+                        "stage1", model.context_model.lm_head,
+                        model.context_model.config.hidden_size,
+                        model.context_model.config.vocab_size
+                    )
+                if hasattr(model.answer_model, 'lm_head'):
+                    ca_collector.set_lm_head(
+                        "stage2", model.answer_model.lm_head,
+                        model.answer_model.config.hidden_size,
+                        model.answer_model.config.vocab_size
+                    )
         
         for subject in subjects:
+            # Set cache analysis context for this subject
+            if ca_collector.enabled:
+                ctx_kwargs = {"model_type": model_type, "subject": subject, "stage": "prefill"}
+                if model_type == "rosetta" and isinstance(model, RosettaModel):
+                    model.set_cache_analysis_context(**ctx_kwargs)
+                elif hasattr(model, 'set_cache_analysis_context'):
+                    model.set_cache_analysis_context(**ctx_kwargs)
+
             cors, acc, _, length_stats, cot_logs = self.evaluate_subject(
                 subject, model, tokenizer, device, model_type, llm_tokenizer
             )
@@ -1632,6 +1725,16 @@ class UnifiedEvaluator:
                     for cat, subcat_list in self.dataset_config["categories"].items():
                         if subcat in subcat_list:
                             cat_cors[cat].append(cors)
+
+        # --- Finalize cache analysis ---
+        if ca_collector.enabled:
+            ca_collector.finalize(
+                dataset=self.dataset_name,
+                model_name=self.model_config["model_name"],
+                answer_method=self.eval_config["answer_method"],
+                start_index=self.start_index,
+                num_of_tasks=self.num_of_tasks,
+            )
         
         return_dict[rank] = {
             "all_cors": all_cors,
@@ -1867,8 +1970,13 @@ def main():
     
     print("Using config: ", args.config)
 
-    # Remove CUDA_VISIBLE_DEVICES to use all GPUs
-    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    # Respect user-set CUDA_VISIBLE_DEVICES (do NOT pop it).
+    # gpu_ids in config are interpreted relative to visible devices.
+    cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_vis is not None:
+        print(f"CUDA_VISIBLE_DEVICES={cuda_vis}  (gpu_ids in config are relative to these visible devices)")
+    else:
+        print("CUDA_VISIBLE_DEVICES not set — all GPUs visible")
     
     # Create and run evaluator
     evaluator = UnifiedEvaluator(config)
