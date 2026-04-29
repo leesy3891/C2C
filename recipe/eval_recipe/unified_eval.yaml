@@ -1,12 +1,11 @@
 model:
-  # model_name: Qwen/Qwen3-0.6B
   model_name: Rosetta
-  rosetta_config:  # Only needed for Rosetta models
+  rosetta_config:
     base_model: Qwen/Qwen3-8B
     teacher_model: Qwen/Qwen2.5-7B-Instruct
     is_do_alignment: false
     alignment_strategy: "longest"
-    checkpoints_dir: local/checkpoints/qwen3_8b+qwen2.5_7b_Fuser/final
+    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
   
   # Two stage
   # model_name: "two_stage"  # Use two-stage pipeline
