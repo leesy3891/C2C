@@ -28,7 +28,7 @@ model:
     frequency_penalty: 1.0
 
 output:
-  output_dir: local/final_results/0.6+0.5B_C2C_general_again
+  output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
   dataset: gpqa
