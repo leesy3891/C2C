@@ -1,0 +1,20 @@
+{
+  "dataset": "ai2-arc",
+  "model_name": "Rosetta",
+  "answer_method": "generate",
+  "start_index": 0,
+  "num_of_tasks": 300,
+  "cache_names": [
+    "fused",
+    "receiver",
+    "sharer"
+  ],
+  "num_records": 32076,
+  "rank": 0,
+  "pca_config": {
+    "max_pca_points_per_layer": 2500,
+    "pca_sample_seed": 42
+  },
+  "entropy_definition": "Logit-lens entropy: key cache reshaped to (B,T,H*D_head), projected through lm_head, softmax(logits/temperature), then Shannon entropy. Normalized by log(vocab_size).",
+  "kl_definition": "KL(layer_l || layer_{l-1}): magnitude-normalized distribution of abs(key_cache).flatten(), aligned by kl_vector_align setting."
+}
