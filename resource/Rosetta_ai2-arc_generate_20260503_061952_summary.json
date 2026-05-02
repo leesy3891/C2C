@@ -1,0 +1,20 @@
+{
+  "model": "Rosetta",
+  "dataset": "ai2-arc",
+  "answer_method": "generate",
+  "overall_accuracy": 0.7811447811447811,
+  "subjects": {
+    "SPLIT_0_OF_1": 0.7811447811447811
+  },
+  "length_statistics": {
+    "subjects": {
+      "SPLIT_0_OF_1": {
+        "avg_input_length": 140.9124579124579,
+        "avg_gen_length": 17.22895622895623,
+        "avg_length_ratio": 0.12922504659994136,
+        "accuracy": 0.7811447811447811,
+        "total_samples": 297
+      }
+    }
+  }
+}

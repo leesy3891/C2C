@@ -1,0 +1,7 @@
+{
+  "model": "Rosetta",
+  "dataset": "gpqa",
+  "answer_method": "generate",
+  "overall_accuracy": 0,
+  "subjects": {}
+}

@@ -1,0 +1,20 @@
+{
+  "model": "Rosetta",
+  "dataset": "gpqa",
+  "answer_method": "generate",
+  "overall_accuracy": 0.28,
+  "subjects": {
+    "SPLIT_0_OF_1": 0.28
+  },
+  "length_statistics": {
+    "subjects": {
+      "SPLIT_0_OF_1": {
+        "avg_input_length": 274.84,
+        "avg_gen_length": 9.56,
+        "avg_length_ratio": 0.03755373606207932,
+        "accuracy": 0.28,
+        "total_samples": 50
+      }
+    }
+  }
+}
