@@ -30,7 +30,7 @@ output:
   output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: arc_challenge
+  dataset: ai2-arc
   # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
   # Example: CUDA_VISIBLE_DEVICES=2,3 + gpu_ids: [0,1] => physical GPU 2 and 3.
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
