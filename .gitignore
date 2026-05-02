@@ -25,3 +25,5 @@ test.py
 script/train/SFT_train_debug.py
 AGENTS.md
 package-lock.json
+!resource/cache_analysis/pca/**/*.png
+!resource/cache_analysis/plots/**/*.png
