@@ -36,7 +36,7 @@ eval:
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
   gpu_ids: [0]
   answer_method: generate  # 'generate' or 'logits'
-  use_cot: false  # Enable chain-of-thought reasoning
+  use_cot: true  # Enable chain-of-thought reasoning
   use_template: true
   sample_interval: 1  # Sample every N examples
   # limit:   # Limit examples per subject (null for all) — backward compatible
