@@ -30,7 +30,7 @@ output:
   output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: ai2-arc
+  dataset: gpqa
   # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
   # Example: CUDA_VISIBLE_DEVICES=2,3 + gpu_ids: [0,1] => physical GPU 2 and 3.
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
@@ -49,7 +49,7 @@ eval:
   # num_of_tasks: how many samples from start_index (null = until end)
   # Applied BEFORE virtual split (multi-GPU) and BEFORE legacy limit.
   start_index: 0
-  num_of_tasks: 300
+  num_of_tasks: 50
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
