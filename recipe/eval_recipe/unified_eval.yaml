@@ -53,7 +53,7 @@ eval:
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
-    enabled: false          # Set to true to activate key-cache diagnostics
+    enabled: true          # Set to true to activate key-cache diagnostics
     target: key             # Only "key" is supported
 
     # --- Entropy settings (logit-lens based) ---
