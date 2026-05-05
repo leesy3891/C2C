@@ -1,0 +1,29 @@
+{
+  "dataset": "ai2-arc",
+  "model_name": "Rosetta",
+  "answer_method": "generate",
+  "start_index": 0,
+  "num_of_tasks": 300,
+  "n_cases": 297,
+  "cache_names": [
+    "fused",
+    "receiver",
+    "sharer"
+  ],
+  "num_records": 32076,
+  "rank": 0,
+  "pca_config": {
+    "max_pca_points_per_layer": 2000,
+    "pca_sample_seed": 42
+  },
+  "lm_head_info": {
+    "receiver": {
+      "hidden_size": 4096,
+      "vocab_size": 151936,
+      "num_attention_heads": 32,
+      "num_kv_heads": 8
+    }
+  },
+  "entropy_definition": "Logit-lens entropy: key cache [B,H_kv,T,D] expanded via GQA head repetition to [B,T,hidden_size], projected through lm_head, softmax(logits/T), Shannon entropy. Normalized by log(vocab_size).",
+  "kl_definition": "KL(l||l-1): magnitude-normalized distribution of abs(key_cache).flatten(), aligned by kl_vector_align."
+}
