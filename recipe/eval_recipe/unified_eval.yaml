@@ -16,7 +16,7 @@ model:
   # Generation configuration - applied to all models during evaluation
   generation_config:
     do_sample: true  # Whether to use sampling (true) or greedy decoding (false)
-    max_new_tokens: 8192  # Maximum number of tokens to generate
+    max_new_tokens: 2048  # Maximum number of tokens to generate
     # Sampling parameters (only used when do_sample=true):
     temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
     top_p: 0.8  # Nucleus sampling threshold
@@ -30,7 +30,7 @@ output:
   output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: gpqa
+  dataset: ai2-arc
   # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
   # Example: CUDA_VISIBLE_DEVICES=2,3 + gpu_ids: [0,1] => physical GPU 2 and 3.
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
@@ -49,7 +49,7 @@ eval:
   # num_of_tasks: how many samples from start_index (null = until end)
   # Applied BEFORE virtual split (multi-GPU) and BEFORE legacy limit.
   start_index: 0
-  num_of_tasks: 50
+  num_of_tasks: 300
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
