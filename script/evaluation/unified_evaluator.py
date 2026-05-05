@@ -1655,47 +1655,61 @@ class UnifiedEvaluator:
             # Attach collector to model
             if model_type == "rosetta" and isinstance(model, RosettaModel):
                 model.set_cache_analysis_collector(ca_collector)
-                # Register lm_head for receiver/sharer/fused entropy
+                # Register lm_head for receiver/sharer/fused entropy (with GQA head info)
                 base_m = model.model_list[model.base_model_idx]
                 if hasattr(base_m, 'lm_head'):
+                    cfg = base_m.config
                     ca_collector.set_lm_head(
                         "receiver", base_m.lm_head,
-                        base_m.config.hidden_size, base_m.config.vocab_size
+                        cfg.hidden_size, cfg.vocab_size,
+                        num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                        num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                     )
             elif model_type == "two_stage_rosetta" and isinstance(model, TwoStageRosetta):
                 model.set_cache_analysis_collector(ca_collector)
                 # context model lm_head
                 if hasattr(model.context_model, 'lm_head'):
+                    cfg = model.context_model.config
                     ca_collector.set_lm_head(
                         "stage1", model.context_model.lm_head,
-                        model.context_model.config.hidden_size,
-                        model.context_model.config.vocab_size
+                        cfg.hidden_size, cfg.vocab_size,
+                        num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                        num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                     )
                 # rosetta base model lm_head
                 if hasattr(model.rosetta_model, 'model_list'):
                     base_m = model.rosetta_model.model_list[model.rosetta_model.base_model_idx]
                     if hasattr(base_m, 'lm_head'):
+                        cfg = base_m.config
                         ca_collector.set_lm_head(
                             "receiver", base_m.lm_head,
-                            base_m.config.hidden_size, base_m.config.vocab_size
+                            cfg.hidden_size, cfg.vocab_size,
+                            num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                            num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                         )
                         ca_collector.set_lm_head(
                             "stage2", base_m.lm_head,
-                            base_m.config.hidden_size, base_m.config.vocab_size
+                            cfg.hidden_size, cfg.vocab_size,
+                            num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                            num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                         )
             elif model_type == "two_stage" and isinstance(model, TwoStageInference):
                 model.set_cache_analysis_collector(ca_collector)
                 if hasattr(model.context_model, 'lm_head'):
+                    cfg = model.context_model.config
                     ca_collector.set_lm_head(
                         "stage1", model.context_model.lm_head,
-                        model.context_model.config.hidden_size,
-                        model.context_model.config.vocab_size
+                        cfg.hidden_size, cfg.vocab_size,
+                        num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                        num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                     )
                 if hasattr(model.answer_model, 'lm_head'):
+                    cfg = model.answer_model.config
                     ca_collector.set_lm_head(
                         "stage2", model.answer_model.lm_head,
-                        model.answer_model.config.hidden_size,
-                        model.answer_model.config.vocab_size
+                        cfg.hidden_size, cfg.vocab_size,
+                        num_attention_heads=getattr(cfg, 'num_attention_heads', 0),
+                        num_key_value_heads=getattr(cfg, 'num_key_value_heads', getattr(cfg, 'num_attention_heads', 0)),
                     )
         
         for subject in subjects:
