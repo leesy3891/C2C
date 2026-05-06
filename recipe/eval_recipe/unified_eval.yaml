@@ -1,11 +1,11 @@
 model:
   model_name: Rosetta
   rosetta_config:
-    base_model: Qwen/Qwen3-8B
-    teacher_model: Qwen/Qwen2.5-7B-Instruct
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen3-4B
     is_do_alignment: false
     alignment_strategy: "longest"
-    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
+    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_0.6b+qwen3_4b_Fuser/final
   
   # Two stage
   # model_name: "two_stage"  # Use two-stage pipeline
@@ -16,7 +16,7 @@ model:
   # Generation configuration - applied to all models during evaluation
   generation_config:
     do_sample: true  # Whether to use sampling (true) or greedy decoding (false)
-    max_new_tokens: 2048  # Maximum number of tokens to generate
+    max_new_tokens: 8  # Maximum number of tokens to generate
     # Sampling parameters (only used when do_sample=true):
     temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
     top_p: 0.8  # Nucleus sampling threshold
@@ -27,7 +27,7 @@ model:
     frequency_penalty: 1.0
 
 output:
-  output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
+  output_dir: local/final_results/qwen3_4b+qwen3_0.6b_Fuser
 
 eval:
   dataset: ai2-arc
@@ -36,7 +36,7 @@ eval:
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
   gpu_ids: [0]
   answer_method: generate  # 'generate' or 'logits'
-  use_cot: true  # Enable chain-of-thought reasoning
+  use_cot: false  # Enable chain-of-thought reasoning
   use_template: true
   sample_interval: 1  # Sample every N examples
   # limit:   # Limit examples per subject (null for all) — backward compatible
@@ -49,7 +49,7 @@ eval:
   # num_of_tasks: how many samples from start_index (null = until end)
   # Applied BEFORE virtual split (multi-GPU) and BEFORE legacy limit.
   start_index: 0
-  num_of_tasks: 300
+  num_of_tasks: null
 
   # ── Cache analysis (new) ───────────────────────────────────────────
   cache_analysis:
