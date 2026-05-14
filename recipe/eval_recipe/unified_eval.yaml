@@ -17,7 +17,7 @@ model:
   # Generation configuration - applied to all models during evaluation
   generation_config:
     do_sample: true  # Whether to use sampling (true) or greedy decoding (false)
-    max_new_tokens: 8  # Maximum number of tokens to generate
+    max_new_tokens: 64  # Maximum number of tokens to generate
     # Sampling parameters (only used when do_sample=true):
     temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
     top_p: 0.8  # Nucleus sampling threshold
