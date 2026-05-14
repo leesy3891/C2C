@@ -21,8 +21,8 @@ model:
     # Sampling parameters (only used when do_sample=true):
     temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
     top_p: 0.8  # Nucleus sampling threshold
-    top_k: 20  # Top-k sampling threshold
-    min_p: 0.05  # Minimum probability threshold
+    # top_k: 20  # Top-k sampling threshold
+    # min_p: 0.05  # Minimum probability threshold
     repetition_penalty: 1.0  # Penalty for repeating tokens
     presence_penalty: 1.5  # Penalty for repeating tokens
     frequency_penalty: 1.0
