@@ -31,7 +31,7 @@ output:
   output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: gsm8k
+  dataset: gpqa
   gpu_ids: [1]  # GPUs to use for evaluation
   answer_method: generate  # 'generate' or 'logits'
   use_cot: false  # Enable chain-of-thought reasoning
