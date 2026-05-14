@@ -2,11 +2,11 @@ model:
   # model_name: Qwen/Qwen3-0.6B
   model_name: Rosetta
   rosetta_config:
-    base_model: Qwen/Qwen3-0.6B
-    teacher_model: Qwen/Qwen3-4B
+    base_model: Qwen/Qwen3-8B
+    teacher_model: Qwen/Qwen2.5-7B-Instruct
     is_do_alignment: true
     alignment_strategy: "longest"
-    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_0.6b+qwen3_4b_Fuser/final
+    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
   
   # Two stage
   # model_name: "two_stage"  # Use two-stage pipeline
@@ -28,10 +28,10 @@ model:
     frequency_penalty: 1.0
 
 output:
-  output_dir: local/final_results/qwen3_4b+qwen3_0.6b_Fuser
+  output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: ceval
+  dataset: gsm8k
   gpu_ids: [1]  # GPUs to use for evaluation
   answer_method: generate  # 'generate' or 'logits'
   use_cot: false  # Enable chain-of-thought reasoning
