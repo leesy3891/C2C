@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from rosetta.model.projector import create_projector
 from rosetta.model.wrapper import RosettaModel
-from rosetta.train.dataset_adapters import OpenBookChatDataset
+from rosetta.train.dataset_adapters import MMLUChatDataset
 
 def load_qwen_model(model_name):
     model_path = "Qwen/" + model_name
@@ -358,7 +358,7 @@ def main(args):
         print(f"Using specified device: {DEVICE}")
     
     # Changed: OpenBookChatDataset instead of MMLUChatDataset
-    dataset = OpenBookChatDataset(split="test", num_samples=None)
+    dataset = MMLUChatDataset(split="test", num_samples=None)
 
     os.makedirs(args['output_dir'], exist_ok=True)
 
@@ -370,7 +370,7 @@ def main(args):
     layer_idx_offset_list = [0, 0, -8]
 
     if args.get('mode', 'both') in ['sequence', 'both']:
-        num_samples = args.get('num_samples') or 50
+        num_samples = args.get('num_samples') or 100
     else:
         num_samples = args.get('num_samples') or 10
 
