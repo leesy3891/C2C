@@ -335,9 +335,9 @@ def main(args):
     layer_idx_offset_list = [0, 0, -8]
 
     if args.get('mode', 'both') in ['sequence', 'both']:
-        num_samples = args.get('num_samples', 50)
+        num_samples = args.get('num_samples') or 50
     else:
-        num_samples = args.get('num_samples', 10)
+        num_samples = args.get('num_samples') or 10
 
     # ---- Extract KV cache one model at a time to avoid OOM ----
     # k_cache_per_model[model_idx][layer_idx] = list of arrays
