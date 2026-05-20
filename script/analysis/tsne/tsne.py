@@ -307,6 +307,15 @@ def plot_model_correspondence(tsne_result, token_indices, model1_name, model2_na
              label=f'{model1_name} ↔ {model2_name} correspondence')
 
 
+def free_model(model):
+    """Delete model and free GPU memory"""
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+
 def main(args):
     global DEVICE
     if 'device' in args and args['device'] is not None:
@@ -316,19 +325,6 @@ def main(args):
     # Changed: OpenBookChatDataset instead of MMLUChatDataset
     dataset = OpenBookChatDataset(split="test", num_samples=None)
 
-    all_models = []
-    all_tokenizers = []
-    for model_path in args['models']:
-        print(f"Loading model: {model_path}")
-        if "Rosetta" in model_path:
-            # Changed: Fuser checkpoint path (Qwen3-8B + Qwen2.5-7B-Instruct)
-            model, tokenizer = load_rosetta_model("local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final")
-        else:
-            model, tokenizer = load_qwen_model(model_path)
-        model.eval()
-        all_models.append(model)
-        all_tokenizers.append(tokenizer)
-
     os.makedirs(args['output_dir'], exist_ok=True)
 
     # Changed: Analyze last 7 layers of 36-layer Qwen3-8B (layers 29-35)
@@ -337,19 +333,44 @@ def main(args):
     # Rosetta & Qwen3-8B both have 36 layers -> offset 0
     # Qwen2.5-7B-Instruct has 28 layers -> offset -8 (layer 29-8=21 maps to equivalent depth)
     layer_idx_offset_list = [0, 0, -8]
-    for layer_idx in layers_to_analyze:
-        if args.get('mode', 'both') in ['sequence', 'both']:
-            num_samples = args.get('num_samples', 50)
+
+    if args.get('mode', 'both') in ['sequence', 'both']:
+        num_samples = args.get('num_samples', 50)
+    else:
+        num_samples = args.get('num_samples', 10)
+
+    # ---- Extract KV cache one model at a time to avoid OOM ----
+    # k_cache_per_model[model_idx][layer_idx] = list of arrays
+    k_cache_per_model = {i: {} for i in range(len(args['models']))}
+
+    for model_idx, (model_path, layer_offset) in enumerate(zip(args['models'], layer_idx_offset_list)):
+        print(f"\n{'='*60}")
+        print(f"Loading model [{model_idx+1}/{len(args['models'])}]: {model_path}")
+        print(f"{'='*60}")
+
+        if "Rosetta" in model_path:
+            model, tokenizer = load_rosetta_model("local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final")
         else:
-            num_samples = args.get('num_samples', 10)
-        
-        k_layer_embeddings = []
-        v_layer_embeddings = []
-        for model, tokenizer, layer_idx_offset in zip(all_models, all_tokenizers, layer_idx_offset_list):
-            k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=layer_idx + layer_idx_offset, num_samples=num_samples)
-            # v_values = extract_v_cache(model, tokenizer, dataset, layer_idx=layer_idx, num_samples=num_samples)
-            k_layer_embeddings.append(k_values)
-            # v_layer_embeddings.append(v_values)
+            model, tokenizer = load_qwen_model(model_path)
+        model.eval()
+
+        for layer_idx in layers_to_analyze:
+            actual_layer = layer_idx + layer_offset
+            print(f"  Extracting K cache: layer {layer_idx} (actual={actual_layer})")
+            k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=actual_layer, num_samples=num_samples)
+            k_cache_per_model[model_idx][layer_idx] = k_values
+
+        # Free GPU memory before loading the next model
+        print(f"  Unloading {model_path} to free GPU memory...")
+        free_model(model)
+
+    # ---- Plot t-SNE (all data is on CPU now, GPU is free) ----
+    print(f"\n{'='*60}")
+    print("Generating t-SNE plots...")
+    print(f"{'='*60}")
+
+    for layer_idx in layers_to_analyze:
+        k_layer_embeddings = [k_cache_per_model[i][layer_idx] for i in range(len(args['models']))]
 
         if args.get('mode', 'both') in ['token', 'both']:
             plot_tsne_per_token(k_layer_embeddings, "k", args['models'], layer_idx, args['output_dir'], 
@@ -358,9 +379,6 @@ def main(args):
         if args.get('mode', 'both') in ['sequence', 'both']:
             plot_tsne_per_sequence(k_layer_embeddings, "k", args['models'], layer_idx, args['output_dir'], 
                                   args.get('show_correspondence', True))
-        
-        # plot_tsne(v_layer_embeddings, "v", args['models'], layer_idx, args['output_dir'], 
-                #  args.get('show_correspondence', True))
 
 
 if __name__ == "__main__":
