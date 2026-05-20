@@ -356,7 +356,7 @@ def main(args):
     for model_path in args['models']:
         print(f"Loading model: {model_path}")
         if "Rosetta" in model_path:
-            model, tokenizer = load_rosetta_model("local/checkpoints/qwen3_0.6b+qwen3_4b_Fuser/final")
+            model, tokenizer = load_rosetta_model("local/checkpoints/C2C_Fuser/qwen3_0.6b+qwen3_4b_Fuser/final")
         else:
             model, tokenizer = load_qwen_model(model_path)
         model.eval()
