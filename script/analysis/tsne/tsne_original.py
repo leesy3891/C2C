@@ -5,6 +5,7 @@ import json
 import numpy as np
 import torch
 from tqdm import tqdm
+
 from collections import defaultdict
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -172,9 +173,9 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
     plt.ylabel("t-SNE 2")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(output_path, f"tsne_layer_{layer_idx}_{label}_per_token.png"), 
+    plt.savefig(os.path.join(output_path, f"tsne_original_layer_{layer_idx}_{label}_per_token.png"), 
                 dpi=300, bbox_inches='tight')
-    print(f"Saved: tsne_layer_{layer_idx}_{label}_per_token.png")
+    print(f"Saved: tsne_original_layer_{layer_idx}_{label}_per_token.png")
     
     # 如果启用对应关系，添加连线
     if show_correspondence:
@@ -185,9 +186,9 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
         plt.ylabel("t-SNE 2")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(output_path, f"tsne_layer_{layer_idx}_{label}_per_token_with_correspondence.png"), 
+        plt.savefig(os.path.join(output_path, f"tsne_original_layer_{layer_idx}_{label}_per_token_with_correspondence.png"), 
                     dpi=300, bbox_inches='tight')
-        print(f"Saved: tsne_layer_{layer_idx}_{label}_per_token_with_correspondence.png")
+        print(f"Saved: tsne_original_layer_{layer_idx}_{label}_per_token_with_correspondence.png")
 
 
 def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
@@ -233,9 +234,9 @@ def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output
     plt.ylabel("t-SNE 2")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(output_path, f"tsne_layer_{layer_idx}_{label}_per_sequence.png"), 
+    plt.savefig(os.path.join(output_path, f"tsne_original_layer_{layer_idx}_{label}_per_sequence.png"), 
                 dpi=300, bbox_inches='tight')
-    print(f"Saved: tsne_layer_{layer_idx}_{label}_per_sequence.png")
+    print(f"Saved: tsne_original_layer_{layer_idx}_{label}_per_sequence.png")
     
     # 如果启用对应关系，添加连线
     if show_correspondence:
@@ -246,9 +247,9 @@ def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output
         plt.ylabel("t-SNE 2")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(output_path, f"tsne_layer_{layer_idx}_{label}_per_sequence_with_correspondence.png"), 
+        plt.savefig(os.path.join(output_path, f"tsne_original_layer_{layer_idx}_{label}_per_sequence_with_correspondence.png"), 
                     dpi=300, bbox_inches='tight')
-        print(f"Saved: tsne_layer_{layer_idx}_{label}_per_sequence_with_correspondence.png")
+        print(f"Saved: tsne_original_layer_{layer_idx}_{label}_per_sequence_with_correspondence.png")
 
 
 def plot_sequence_correspondence_lines(tsne_result, sequence_indices, model_names, label):
