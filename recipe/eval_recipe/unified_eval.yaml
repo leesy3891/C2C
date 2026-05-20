@@ -1,12 +1,21 @@
 model:
   # model_name: Qwen/Qwen3-0.6B
   model_name: Rosetta
+<<<<<<< HEAD
   rosetta_config:  # Only needed for Rosetta models
     base_model: Qwen/Qwen3-8B
     teacher_model: Qwen/Qwen2.5-7B-Instruct
     is_do_alignment: false
     alignment_strategy: "longest"
     checkpoints_dir: local/checkpoints/qwen3_8b+qwen2.5_7b_Fuser/final
+=======
+  rosetta_config:
+    base_model: Qwen/Qwen3-8B
+    teacher_model: Qwen/Qwen2.5-7B-Instruct
+    is_do_alignment: true
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
+>>>>>>> 3cde13f7af468a346d920ca7777c63f27d2d51de
   
   # Two stage
   # model_name: "two_stage"  # Use two-stage pipeline
@@ -16,26 +25,30 @@ model:
 
   # Generation configuration - applied to all models during evaluation
   generation_config:
-    do_sample: false  # Whether to use sampling (true) or greedy decoding (false)
+    do_sample: true  # Whether to use sampling (true) or greedy decoding (false)
     max_new_tokens: 64  # Maximum number of tokens to generate
     # Sampling parameters (only used when do_sample=true):
-    # temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
-    # top_p: 0.8  # Nucleus sampling threshold
+    temperature: 0.7  # Controls randomness (0.0 = deterministic, higher = more random)
+    top_p: 0.8  # Nucleus sampling threshold
     # top_k: 20  # Top-k sampling threshold
-    # # min_p: 0.05  # Minimum probability threshold
-    # # repetition_penalty: 1.0  # Penalty for repeating tokens
-    # presence_penalty: 1.5  # Penalty for repeating tokens
-    # frequency_penalty: 1.0
+    # min_p: 0.05  # Minimum probability threshold
+    repetition_penalty: 1.0  # Penalty for repeating tokens
+    presence_penalty: 1.5  # Penalty for repeating tokens
+    frequency_penalty: 1.0
 
 output:
-  output_dir: local/final_results/0.6+0.5B_C2C_general_again
+  output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
   dataset: mmlu-redux
+<<<<<<< HEAD
   # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
   # Example: CUDA_VISIBLE_DEVICES=2,3 + gpu_ids: [0,1] => physical GPU 2 and 3.
   # Example: CUDA_VISIBLE_DEVICES=0 + gpu_ids: [0] => physical GPU 0 only.
   gpu_ids: [0]
+=======
+  gpu_ids: [1]  # GPUs to use for evaluation
+>>>>>>> 3cde13f7af468a346d920ca7777c63f27d2d51de
   answer_method: generate  # 'generate' or 'logits'
   use_cot: false  # Enable chain-of-thought reasoning
   use_template: true
@@ -44,6 +57,7 @@ eval:
   # subjects: ["nutrition"] # Optional: specify specific subjects to evaluate
   # response_text: ""
   math_grading_method: "comprehensive"
+<<<<<<< HEAD
 
   # ── Dataset slicing (new) ──────────────────────────────────────────
   # start_index: first sample index to evaluate (default 0)
@@ -71,3 +85,5 @@ eval:
     pca_sample_seed: 42
     entropy_eps: 1.0e-12
     kl_eps: 1.0e-12
+=======
+>>>>>>> 3cde13f7af468a346d920ca7777c63f27d2d51de

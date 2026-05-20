@@ -1970,6 +1970,7 @@ def main():
     
     print("Using config: ", args.config)
 
+<<<<<<< HEAD
     # Respect user-set CUDA_VISIBLE_DEVICES (do NOT pop it).
     # gpu_ids in config are interpreted relative to visible devices.
     cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -1977,6 +1978,16 @@ def main():
         print(f"CUDA_VISIBLE_DEVICES={cuda_vis}  (gpu_ids in config are relative to these visible devices)")
     else:
         print("CUDA_VISIBLE_DEVICES not set — all GPUs visible")
+=======
+    # Respect CUDA_VISIBLE_DEVICES if the user set it externally.
+    # Example: CUDA_VISIBLE_DEVICES=2 python script/evaluation/unified_evaluator.py --config ...
+    # Inside the process, visible CUDA devices are re-indexed from 0, so GPU 2 becomes cuda:0.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        visible_gpu_ids = [d.strip() for d in visible_devices.split(",") if d.strip()]
+        config.setdefault("eval", {})["gpu_ids"] = list(range(len(visible_gpu_ids)))
+        print(f"CUDA_VISIBLE_DEVICES={visible_devices}; using visible GPU IDs {config['eval']['gpu_ids']}")
+>>>>>>> 3cde13f7af468a346d920ca7777c63f27d2d51de
     
     # Create and run evaluator
     evaluator = UnifiedEvaluator(config)

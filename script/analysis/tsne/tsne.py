@@ -9,11 +9,12 @@ from collections import defaultdict
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
 from rosetta.model.projector import create_projector
 from rosetta.model.wrapper import RosettaModel
-from rosetta.train.dataset_adapters import MMLUChatDataset
+from rosetta.train.dataset_adapters import OpenBookChatDataset
 
 def load_qwen_model(model_name):
     model_path = "Qwen/" + model_name
@@ -27,8 +28,8 @@ def load_rosetta_model(checkpoint_dir):
     from rosetta.model.projector import load_projector
     import re
     
-    slm_model_path = "Qwen/Qwen3-0.6B"
-    llm_model_path = "Qwen/Qwen3-4B"
+    slm_model_path = "Qwen/Qwen3-8B"
+    llm_model_path = "Qwen/Qwen2.5-7B-Instruct"
 
     # Load tokenizer
     slm_tokenizer = AutoTokenizer.from_pretrained(slm_model_path)
@@ -76,10 +77,8 @@ def load_rosetta_model(checkpoint_dir):
 
 def extract_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
     all_values = []
-    # 选择指定数量的样本
     subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
     for i, sample in enumerate(tqdm(subset, desc=f"Layer {layer_idx}")):
-        # Use normal MMLU question without extra prompt
         instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
         input = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
         instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(input['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
@@ -103,10 +102,8 @@ def extract_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
 
 def extract_v_cache(model, tokenizer, dataset, layer_idx, num_samples=20):
     all_values = []
-    # 选择指定数量的样本
     subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
     for i, sample in enumerate(tqdm(subset, desc=f"Layer {layer_idx}")):
-        # Use normal MMLU question without extra prompt
         instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
         input = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
         instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(input['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
@@ -128,25 +125,52 @@ def extract_v_cache(model, tokenizer, dataset, layer_idx, num_samples=20):
 
     return all_values
 
+def align_dimensions(all_embeddings, target_dim=None):
+    """
+    Align embedding dimensions across models using PCA.
+    Different models may have different num_kv_heads, resulting in different
+    flattened KV cache dimensions (e.g., Qwen3-8B: 1024, Qwen2.5-7B: 512).
+    This projects all embeddings to a common dimension space.
+    """
+    dims = [emb[0].shape[1] for emb in all_embeddings if len(emb) > 0]
+    if len(set(dims)) == 1:
+        return all_embeddings  # Already aligned
+
+    if target_dim is None:
+        target_dim = min(dims)
+
+    aligned = []
+    for emb_list in all_embeddings:
+        d = emb_list[0].shape[1]
+        if d == target_dim:
+            aligned.append(emb_list)
+        else:
+            # Fit PCA on all tokens from this model, then transform each sample
+            all_tokens = np.concatenate(emb_list, axis=0)
+            pca = PCA(n_components=target_dim)
+            pca.fit(all_tokens)
+            aligned.append([pca.transform(arr) for arr in emb_list])
+    return aligned
+
+
 def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
-    """绘制每个token的t-SNE图"""
+    # Align dimensions across models (e.g., 1024 vs 512)
+    all_embeddings = align_dimensions(all_embeddings)
+
     tsne = TSNE(n_components=2, perplexity=30, random_state=2)
     
     # Flatten all embeddings from all models and samples
     X = np.concatenate([np.concatenate(emb, axis=0) for emb in all_embeddings], axis=0)
     tsne_result = tsne.fit_transform(X)
 
-    # 构建颜色标签 - 为每个 token 分配模型名称
     color_labels = []
-    token_indices = []  # 记录每个token在原始数据中的位置信息
+    token_indices = []
     current_idx = 0
     
     for i, emb in enumerate(all_embeddings):
-        # emb is a list of arrays, each array has shape (seq_len, num_heads * head_dim)
         for sample_idx, arr in enumerate(emb):
             total_tokens = arr.shape[0]
             color_labels.extend([model_names[i]] * total_tokens)
-            # 记录每个token的模型索引和样本索引
             for token_idx in range(total_tokens):
                 token_indices.append({
                     'model_idx': i,
@@ -157,16 +181,13 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
                 })
             current_idx += total_tokens
 
-    # 创建基础散点图
     plt.figure(figsize=(15, 10))
     
-    # 绘制所有点
     for model_name in set(color_labels):
         indices = [j for j, lbl in enumerate(color_labels) if lbl == model_name]
         plt.scatter(tsne_result[indices, 0], tsne_result[indices, 1], 
                    label=model_name, s=8, alpha=0.7)
 
-    # 先保存无对应关系的版本
     plt.title(f"TSNE of {label} Cache (Layer {layer_idx}) - Per Token")
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
@@ -176,7 +197,6 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
                 dpi=300, bbox_inches='tight')
     print(f"Saved: tsne_layer_{layer_idx}_{label}_per_token.png")
     
-    # 如果启用对应关系，添加连线
     if show_correspondence:
         plot_correspondence_lines(tsne_result, token_indices, model_names, label)
         
@@ -191,18 +211,17 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
 
 
 def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
-    """绘制每个序列的t-SNE图"""
+    # Align dimensions across models (e.g., 1024 vs 512)
+    all_embeddings = align_dimensions(all_embeddings)
+
     tsne = TSNE(n_components=2, perplexity=min(30, len(all_embeddings[0])-1), random_state=42)
     
-    # 为每个序列计算平均嵌入
     sequence_embeddings = []
-    sequence_indices = []  # 记录每个序列的模型和样本信息
+    sequence_indices = []
     
     for i, emb in enumerate(all_embeddings):
-        # emb is a list of arrays, each array has shape (seq_len, num_heads * head_dim)
         for sample_idx, arr in enumerate(emb):
-            # 计算序列的平均嵌入
-            seq_avg = np.mean(arr, axis=0)  # (num_heads * head_dim,)
+            seq_avg = np.mean(arr, axis=0)
             sequence_embeddings.append(seq_avg)
             sequence_indices.append({
                 'model_idx': i,
@@ -211,23 +230,18 @@ def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output
                 'global_idx': len(sequence_embeddings) - 1
             })
     
-    # 转换为numpy数组进行t-SNE
     X = np.array(sequence_embeddings)
     tsne_result = tsne.fit_transform(X)
     
-    # 构建颜色标签
     color_labels = [info['model_name'] for info in sequence_indices]
     
-    # 创建散点图
     plt.figure(figsize=(15, 10))
     
-    # 绘制所有点
     for model_name in set(color_labels):
         indices = [j for j, lbl in enumerate(color_labels) if lbl == model_name]
         plt.scatter(tsne_result[indices, 0], tsne_result[indices, 1], 
                    label=model_name, s=50, alpha=0.7)
 
-    # 先保存无对应关系的版本
     plt.title(f"TSNE of {label} Cache (Layer {layer_idx}) - Per Sequence")
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
@@ -237,7 +251,6 @@ def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output
                 dpi=300, bbox_inches='tight')
     print(f"Saved: tsne_layer_{layer_idx}_{label}_per_sequence.png")
     
-    # 如果启用对应关系，添加连线
     if show_correspondence:
         plot_sequence_correspondence_lines(tsne_result, sequence_indices, model_names, label)
         
@@ -252,24 +265,20 @@ def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output
 
 
 def plot_sequence_correspondence_lines(tsne_result, sequence_indices, model_names, label):
-    """绘制序列级别的模型对应关系连线"""
-    # 找到模型索引
     model_idx_map = {name: idx for idx, name in enumerate(model_names)}
     
-    # 0.6B 和 Rosetta 的对应关系
-    if 'Qwen3-0.6B' in model_idx_map and 'Rosetta' in model_idx_map:
+    # Qwen3-8B (base) <-> Rosetta correspondence
+    if 'Qwen3-8B' in model_idx_map and 'Rosetta' in model_idx_map:
         plot_sequence_model_correspondence(tsne_result, sequence_indices, 
-                                         'Qwen3-0.6B', 'Rosetta', 'blue', alpha=0.5)
+                                         'Qwen3-8B', 'Rosetta', 'blue', alpha=0.5)
     
-    # Rosetta 和 4B 的对应关系
-    if 'Rosetta' in model_idx_map and 'Qwen3-4B' in model_idx_map:
+    # Rosetta <-> Qwen2.5-7B-Instruct (teacher) correspondence
+    if 'Rosetta' in model_idx_map and 'Qwen2.5-7B-Instruct' in model_idx_map:
         plot_sequence_model_correspondence(tsne_result, sequence_indices, 
-                                         'Rosetta', 'Qwen3-4B', 'red', alpha=0.5)
+                                         'Rosetta', 'Qwen2.5-7B-Instruct', 'red', alpha=0.5)
 
 
 def plot_sequence_model_correspondence(tsne_result, sequence_indices, model1_name, model2_name, color, alpha=0.5):
-    """绘制两个模型之间的序列级别对应关系连线"""
-    # 按样本索引分组
     model1_sequences = {}
     model2_sequences = {}
     
@@ -280,7 +289,6 @@ def plot_sequence_model_correspondence(tsne_result, sequence_indices, model1_nam
         elif seq_info['model_name'] == model2_name:
             model2_sequences[sample_idx] = seq_info['global_idx']
     
-    # 绘制对应关系连线
     for sample_idx in model1_sequences:
         if sample_idx in model2_sequences:
             idx1 = model1_sequences[sample_idx]
@@ -291,30 +299,25 @@ def plot_sequence_model_correspondence(tsne_result, sequence_indices, model1_nam
             
             plt.plot([x1, x2], [y1, y2], color=color, alpha=alpha, linewidth=1.5)
     
-    # 添加图例说明
     plt.plot([], [], color=color, alpha=alpha, linewidth=2, 
              label=f'{model1_name} ↔ {model2_name} correspondence')
 
 
 def plot_correspondence_lines(tsne_result, token_indices, model_names, label):
-    """绘制模型之间的对应关系连线"""
-    # 找到模型索引
     model_idx_map = {name: idx for idx, name in enumerate(model_names)}
     
-    # 0.6B 和 Rosetta 的对应关系
-    if 'Qwen3-0.6B' in model_idx_map and 'Rosetta' in model_idx_map:
+    # Qwen3-8B (base) <-> Rosetta correspondence
+    if 'Qwen3-8B' in model_idx_map and 'Rosetta' in model_idx_map:
         plot_model_correspondence(tsne_result, token_indices, 
-                                'Qwen3-0.6B', 'Rosetta', 'blue', alpha=0.3)
+                                'Qwen3-8B', 'Rosetta', 'blue', alpha=0.3)
     
-    # Rosetta 和 4B 的对应关系
-    if 'Rosetta' in model_idx_map and 'Qwen3-4B' in model_idx_map:
+    # Rosetta <-> Qwen2.5-7B-Instruct (teacher) correspondence
+    if 'Rosetta' in model_idx_map and 'Qwen2.5-7B-Instruct' in model_idx_map:
         plot_model_correspondence(tsne_result, token_indices, 
-                                'Rosetta', 'Qwen3-4B', 'red', alpha=0.3)
+                                'Rosetta', 'Qwen2.5-7B-Instruct', 'red', alpha=0.3)
 
 
 def plot_model_correspondence(tsne_result, token_indices, model1_name, model2_name, color, alpha=0.3):
-    """绘制两个模型之间的对应关系连线"""
-    # 按样本和token位置分组
     model1_tokens = {}
     model2_tokens = {}
     
@@ -325,7 +328,6 @@ def plot_model_correspondence(tsne_result, token_indices, model1_name, model2_na
         elif token_info['model_name'] == model2_name:
             model2_tokens[key] = token_info['global_idx']
     
-    # 绘制对应关系连线
     for key in model1_tokens:
         if key in model2_tokens:
             idx1 = model1_tokens[key]
@@ -336,55 +338,75 @@ def plot_model_correspondence(tsne_result, token_indices, model1_name, model2_na
             
             plt.plot([x1, x2], [y1, y2], color=color, alpha=alpha, linewidth=0.5)
     
-    # 添加图例说明
     plt.plot([], [], color=color, alpha=alpha, linewidth=2, 
              label=f'{model1_name} ↔ {model2_name} correspondence')
 
 
+def free_model(model):
+    """Delete model and free GPU memory"""
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+
 def main(args):
-    # 更新全局设备设置
     global DEVICE
     if 'device' in args and args['device'] is not None:
         DEVICE = args['device']
         print(f"Using specified device: {DEVICE}")
     
-    dataset = MMLUChatDataset(split="validation", num_samples=None)
-
-    all_models = []
-    all_tokenizers = []
-    for model_path in args['models']:
-        print(f"Loading model: {model_path}")
-        if "Rosetta" in model_path:
-            model, tokenizer = load_rosetta_model("local/checkpoints/0.6B_4B_context/final")
-        else:
-            model, tokenizer = load_qwen_model(model_path)
-        model.eval()
-        all_models.append(model)
-        all_tokenizers.append(tokenizer)
+    # Changed: OpenBookChatDataset instead of MMLUChatDataset
+    dataset = OpenBookChatDataset(split="test", num_samples=None)
 
     os.makedirs(args['output_dir'], exist_ok=True)
 
-    # 只分析几个关键层
-    layers_to_analyze = [21,22,23,24,25,26,27]  # 选择几个代表性的层
-    layer_idx_offset_list = [0, 0, 8]
-    for layer_idx in layers_to_analyze:
-        # 根据模式选择样本数量
-        if args.get('mode', 'both') in ['sequence', 'both']:
-            # per sequence模式需要更多样本以获得更好的可视化效果
-            num_samples = args.get('num_samples', 50)
-        else:
-            # per token模式样本数可以少一些
-            num_samples = args.get('num_samples', 10)
-        
-        k_layer_embeddings = []
-        v_layer_embeddings = []
-        for model, tokenizer, layer_idx_offset in zip(all_models, all_tokenizers, layer_idx_offset_list):
-            k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=layer_idx + layer_idx_offset, num_samples=num_samples)
-            # v_values = extract_v_cache(model, tokenizer, dataset, layer_idx=layer_idx, num_samples=num_samples)
-            k_layer_embeddings.append(k_values)
-            # v_layer_embeddings.append(v_values)
+    # Changed: Analyze last 7 layers of 36-layer Qwen3-8B (layers 29-35)
+    layers_to_analyze = [29, 30, 31, 32, 33, 34, 35]
+    # Offsets: [Rosetta(base=8B), Qwen3-8B, Qwen2.5-7B-Instruct]
+    # Rosetta & Qwen3-8B both have 36 layers -> offset 0
+    # Qwen2.5-7B-Instruct has 28 layers -> offset -8 (layer 29-8=21 maps to equivalent depth)
+    layer_idx_offset_list = [0, 0, -8]
 
-        # 根据模式选择绘制方式
+    if args.get('mode', 'both') in ['sequence', 'both']:
+        num_samples = args.get('num_samples') or 50
+    else:
+        num_samples = args.get('num_samples') or 10
+
+    # ---- Extract KV cache one model at a time to avoid OOM ----
+    # k_cache_per_model[model_idx][layer_idx] = list of arrays
+    k_cache_per_model = {i: {} for i in range(len(args['models']))}
+
+    for model_idx, (model_path, layer_offset) in enumerate(zip(args['models'], layer_idx_offset_list)):
+        print(f"\n{'='*60}")
+        print(f"Loading model [{model_idx+1}/{len(args['models'])}]: {model_path}")
+        print(f"{'='*60}")
+
+        if "Rosetta" in model_path:
+            model, tokenizer = load_rosetta_model("local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final")
+        else:
+            model, tokenizer = load_qwen_model(model_path)
+        model.eval()
+
+        for layer_idx in layers_to_analyze:
+            actual_layer = layer_idx + layer_offset
+            print(f"  Extracting K cache: layer {layer_idx} (actual={actual_layer})")
+            k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=actual_layer, num_samples=num_samples)
+            k_cache_per_model[model_idx][layer_idx] = k_values
+
+        # Free GPU memory before loading the next model
+        print(f"  Unloading {model_path} to free GPU memory...")
+        free_model(model)
+
+    # ---- Plot t-SNE (all data is on CPU now, GPU is free) ----
+    print(f"\n{'='*60}")
+    print("Generating t-SNE plots...")
+    print(f"{'='*60}")
+
+    for layer_idx in layers_to_analyze:
+        k_layer_embeddings = [k_cache_per_model[i][layer_idx] for i in range(len(args['models']))]
+
         if args.get('mode', 'both') in ['token', 'both']:
             plot_tsne_per_token(k_layer_embeddings, "k", args['models'], layer_idx, args['output_dir'], 
                                args.get('show_correspondence', True))
@@ -392,33 +414,31 @@ def main(args):
         if args.get('mode', 'both') in ['sequence', 'both']:
             plot_tsne_per_sequence(k_layer_embeddings, "k", args['models'], layer_idx, args['output_dir'], 
                                   args.get('show_correspondence', True))
-        
-        # plot_tsne(v_layer_embeddings, "v", args['models'], layer_idx, args['output_dir'], 
-                #  args.get('show_correspondence', True))
 
 
 if __name__ == "__main__":
     """
-    使用示例:
-    python tsne.py                                    # 自动检测设备，显示对应关系，两种模式都生成
-    python tsne.py --device cuda                     # 指定使用CUDA
-    python tsne.py --device cpu                      # 指定使用CPU
-    python tsne.py --output_dir my_plots             # 指定输出目录
-    python tsne.py --models Rosetta Qwen3-0.6B       # 指定要分析的模型
-    python tsne.py --no-correspondence               # 不显示对应关系连线
-    python tsne.py --mode token                      # 只生成token级别的图（10个样本）
-    python tsne.py --mode sequence                   # 只生成序列级别的图（50个样本）
-    python tsne.py --mode both                       # 生成两种模式的图（默认）
-    python tsne.py --num_samples 100                 # 指定使用100个样本
-    python tsne.py --mode sequence --num_samples 30  # 序列模式使用30个样本
+    Usage examples:
+    python tsne.py                                    # Auto-detect device, show correspondence, both modes
+    python tsne.py --device cuda                     # Use CUDA
+    python tsne.py --device cpu                      # Use CPU
+    python tsne.py --output_dir my_plots             # Custom output directory
+    python tsne.py --models Rosetta Qwen3-8B         # Specify models to analyze
+    python tsne.py --no-correspondence               # Disable correspondence lines
+    python tsne.py --mode token                      # Token-level only (10 samples)
+    python tsne.py --mode sequence                   # Sequence-level only (50 samples)
+    python tsne.py --mode both                       # Both modes (default)
+    python tsne.py --num_samples 100                 # Use 100 samples
+    python tsne.py --mode sequence --num_samples 30  # Sequence mode with 30 samples
     """
     parser = argparse.ArgumentParser(description='Generate t-SNE plots for KV cache analysis')
     parser.add_argument('--device', type=str, default=None, 
                        help='Device to use (cuda, mps, cpu). If not specified, auto-detect.')
-    parser.add_argument('--output_dir', type=str, default="new_tsne_outputs",
+    parser.add_argument('--output_dir', type=str, default="tsne_outputs_openbookqa",
                        help='Output directory for t-SNE plots')
+    # Changed: Default models to match Fuser config (Qwen3-8B + Qwen2.5-7B-Instruct)
     parser.add_argument('--models', nargs='+', 
-                       default=["Rosetta", "Qwen3-0.6B", "Qwen3-4B"],
+                       default=["Rosetta", "Qwen3-8B", "Qwen2.5-7B-Instruct"],
                        help='Models to analyze')
     parser.add_argument('--no-correspondence', action='store_true',
                        help='Disable correspondence lines between models')
@@ -429,6 +449,17 @@ if __name__ == "__main__":
                        help='Number of samples to use. If not specified, uses 10 for token mode and 50 for sequence mode')
     
     args = parser.parse_args()
+    
+    # Auto-detect device
+    if args.device is None:
+        if torch.cuda.is_available():
+            DEVICE = "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            DEVICE = "mps"
+        else:
+            DEVICE = "cpu"
+    else:
+        DEVICE = args.device
     
     # Convert to dict for compatibility
     args_dict = {
