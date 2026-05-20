@@ -9,6 +9,7 @@ from collections import defaultdict
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
 from rosetta.model.projector import create_projector
@@ -124,7 +125,38 @@ def extract_v_cache(model, tokenizer, dataset, layer_idx, num_samples=20):
 
     return all_values
 
+def align_dimensions(all_embeddings, target_dim=None):
+    """
+    Align embedding dimensions across models using PCA.
+    Different models may have different num_kv_heads, resulting in different
+    flattened KV cache dimensions (e.g., Qwen3-8B: 1024, Qwen2.5-7B: 512).
+    This projects all embeddings to a common dimension space.
+    """
+    dims = [emb[0].shape[1] for emb in all_embeddings if len(emb) > 0]
+    if len(set(dims)) == 1:
+        return all_embeddings  # Already aligned
+
+    if target_dim is None:
+        target_dim = min(dims)
+
+    aligned = []
+    for emb_list in all_embeddings:
+        d = emb_list[0].shape[1]
+        if d == target_dim:
+            aligned.append(emb_list)
+        else:
+            # Fit PCA on all tokens from this model, then transform each sample
+            all_tokens = np.concatenate(emb_list, axis=0)
+            pca = PCA(n_components=target_dim)
+            pca.fit(all_tokens)
+            aligned.append([pca.transform(arr) for arr in emb_list])
+    return aligned
+
+
 def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
+    # Align dimensions across models (e.g., 1024 vs 512)
+    all_embeddings = align_dimensions(all_embeddings)
+
     tsne = TSNE(n_components=2, perplexity=30, random_state=2)
     
     # Flatten all embeddings from all models and samples
@@ -179,6 +211,9 @@ def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_pa
 
 
 def plot_tsne_per_sequence(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
+    # Align dimensions across models (e.g., 1024 vs 512)
+    all_embeddings = align_dimensions(all_embeddings)
+
     tsne = TSNE(n_components=2, perplexity=min(30, len(all_embeddings[0])-1), random_state=42)
     
     sequence_embeddings = []
