@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from rosetta.model.projector import create_projector
 from rosetta.model.wrapper import RosettaModel
-from rosetta.train.dataset_adapters import MMLUChatDataset
+from rosetta.train.dataset_adapters import OpenBookChatDataset
 
 def load_qwen_model(model_name):
     model_path = "Qwen/" + model_name
@@ -75,18 +75,92 @@ def load_rosetta_model(checkpoint_dir):
 
     return rosetta_model, slm_tokenizer
 
+def extract_fused_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
+    """
+    Extract the *fused* K cache from RosettaModel.
+    
+    RosettaModel.forward() does:
+      1. Run base model (Qwen3-8B) -> base KV cache
+      2. Run sharer model (Qwen2.5-7B) -> source KV cache
+      3. Project source KV into base space -> fused_kv_cache
+      4. Monkeypatch attention to use fused KV for the actual forward pass
+    
+    But output.past_key_values only contains the base model's *own* KV cache,
+    NOT the fused one. To capture the fused KV, we hook into the monkeypatched
+    attention layers and intercept the injected key states.
+    """
+    from rosetta.model.wrapper import clone_kv_cache
+    
+    all_values = []
+    subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
+    
+    for i, sample in enumerate(tqdm(subset, desc=f"Fused Layer {layer_idx}")):
+        instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        inputs = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
+        instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(inputs['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
+        
+        # We need to manually replicate what RosettaModel.forward does for the
+        # prefill section to capture the fused_kv_cache before monkeypatching.
+        with torch.no_grad():
+            # Step 1: Run base model to get base KV cache
+            base_output = model.model_list[model.base_model_idx].forward(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                use_cache=True,
+            )
+            base_kv = base_output.past_key_values
+            
+            # Step 2: Run sharer model(s) to get source KV cache
+            for source_model_idx in range(1, len(model.model_list)):
+                source_output = model.model_list[source_model_idx].forward(
+                    input_ids=inputs['input_ids'],
+                    attention_mask=inputs['attention_mask'],
+                    use_cache=True,
+                )
+                source_kv = source_output.past_key_values
+            
+            # Step 3: Apply projectors to build fused KV cache
+            fused_kv = clone_kv_cache(base_kv)
+            new_length = inputs['input_ids'].shape[1]
+            
+            if (model.base_model_idx in model.projector_dict and 
+                source_model_idx in model.projector_dict[model.base_model_idx]):
+                
+                for target_layer_idx, entry in model.projector_dict[model.base_model_idx][source_model_idx].items():
+                    base_key, base_val = base_kv[target_layer_idx]
+                    new_base_key = base_key[:, :, -new_length:, :]
+                    new_base_val = base_val[:, :, -new_length:, :]
+                    
+                    for source_layer_idx, projector_idx in entry:
+                        src_key, src_val = source_kv[source_layer_idx]
+                        new_src_key = src_key[:, :, -new_length:, :]
+                        new_src_val = src_val[:, :, -new_length:, :]
+                        
+                        proj_key, proj_val = model.projector_list[projector_idx].forward(
+                            (new_src_key, new_src_val),
+                            (new_base_key, new_base_val)
+                        )
+                    
+                    fused_kv.key_cache[target_layer_idx][:, :, -new_length:, :] = proj_key
+                    fused_kv.value_cache[target_layer_idx][:, :, -new_length:, :] = proj_val
+        
+        # Extract fused K cache for the target layer
+        k_value = fused_kv.key_cache[layer_idx].squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
+        k_value_flat = k_value.permute(1, 0, 2).reshape(k_value.shape[1], -1)
+        all_values.append(k_value_flat.numpy())
+    
+    return all_values
+
+
 def extract_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
+    """Extract K cache from a standard (non-Rosetta) model."""
     all_values = []
     subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
     for i, sample in enumerate(tqdm(subset, desc=f"Layer {layer_idx}")):
         instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
         input = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
-        instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(input['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
-            if isinstance(model, RosettaModel):
-                output = model(**input, kv_cache_index=[instruction_index], use_cache=True)
-            else:
-                output = model(**input, use_cache=True)
+            output = model(**input, use_cache=True)
 
         # (batch, num_heads, seq_len, head_dim)
         k_value = output.past_key_values[layer_idx][0].squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
@@ -358,7 +432,7 @@ def main(args):
         print(f"Using specified device: {DEVICE}")
     
     # Changed: OpenBookChatDataset instead of MMLUChatDataset
-    dataset = MMLUChatDataset(split="test", num_samples=None)
+    dataset = OpenBookChatDataset(split="test", num_samples=None)
 
     os.makedirs(args['output_dir'], exist_ok=True)
 
@@ -392,7 +466,11 @@ def main(args):
         for layer_idx in layers_to_analyze:
             actual_layer = layer_idx + layer_offset
             print(f"  Extracting K cache: layer {layer_idx} (actual={actual_layer})")
-            k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=actual_layer, num_samples=num_samples)
+            if "Rosetta" in model_path:
+                # Extract the FUSED KV cache (after projection), not the raw base KV
+                k_values = extract_fused_k_cache(model, tokenizer, dataset, layer_idx=actual_layer, num_samples=num_samples)
+            else:
+                k_values = extract_k_cache(model, tokenizer, dataset, layer_idx=actual_layer, num_samples=num_samples)
             k_cache_per_model[model_idx][layer_idx] = k_values
 
         # Free GPU memory before loading the next model
