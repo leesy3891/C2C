@@ -372,10 +372,10 @@ def main(args):
         # 根据模式选择样本数量
         if args.get('mode', 'both') in ['sequence', 'both']:
             # per sequence模式需要更多样本以获得更好的可视化效果
-            num_samples = args.get('num_samples', 50)
+            num_samples = args.get('num_samples') or 100
         else:
             # per token模式样本数可以少一些
-            num_samples = args.get('num_samples', 10)
+            num_samples = args.get('num_samples') or 10
         
         k_layer_embeddings = []
         v_layer_embeddings = []
