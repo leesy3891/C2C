@@ -77,75 +77,76 @@ def load_rosetta_model(checkpoint_dir):
 
 def extract_fused_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
     """
-    Extract the *fused* K cache from RosettaModel.
+    Extract the *fused* K cache from RosettaModel for a single layer.
     
-    RosettaModel.forward() does:
-      1. Run base model (Qwen3-8B) -> base KV cache
-      2. Run sharer model (Qwen2.5-7B) -> source KV cache
-      3. Project source KV into base space -> fused_kv_cache
-      4. Monkeypatch attention to use fused KV for the actual forward pass
-    
-    But output.past_key_values only contains the base model's *own* KV cache,
-    NOT the fused one. To capture the fused KV, we hook into the monkeypatched
-    attention layers and intercept the injected key states.
+    Memory-efficient: instead of cloning the entire 36-layer KV cache,
+    we only run projection on the target layer and immediately free
+    intermediate outputs.
     """
-    from rosetta.model.wrapper import clone_kv_cache
-    
     all_values = []
     subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
     
     for i, sample in enumerate(tqdm(subset, desc=f"Fused Layer {layer_idx}")):
         instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
         inputs = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
-        instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(inputs['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
         
-        # We need to manually replicate what RosettaModel.forward does for the
-        # prefill section to capture the fused_kv_cache before monkeypatching.
         with torch.no_grad():
-            # Step 1: Run base model to get base KV cache
+            # Step 1: Run base model
             base_output = model.model_list[model.base_model_idx].forward(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
                 use_cache=True,
             )
             base_kv = base_output.past_key_values
+            # Free logits immediately (we only need KV cache)
+            del base_output.logits
             
-            # Step 2: Run sharer model(s) to get source KV cache
-            for source_model_idx in range(1, len(model.model_list)):
-                source_output = model.model_list[source_model_idx].forward(
-                    input_ids=inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    use_cache=True,
-                )
-                source_kv = source_output.past_key_values
+            # Step 2: Run sharer model
+            source_model_idx = 1  # single sharer
+            source_output = model.model_list[source_model_idx].forward(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                use_cache=True,
+            )
+            source_kv = source_output.past_key_values
+            del source_output.logits
             
-            # Step 3: Apply projectors to build fused KV cache
-            fused_kv = clone_kv_cache(base_kv)
+            # Step 3: Project ONLY the target layer (not full clone)
             new_length = inputs['input_ids'].shape[1]
             
+            # Start with base KV for target layer (the default if no projection applies)
+            fused_key = base_kv[layer_idx][0].clone()
+            
             if (model.base_model_idx in model.projector_dict and 
-                source_model_idx in model.projector_dict[model.base_model_idx]):
+                source_model_idx in model.projector_dict[model.base_model_idx] and
+                layer_idx in model.projector_dict[model.base_model_idx][source_model_idx]):
                 
-                for target_layer_idx, entry in model.projector_dict[model.base_model_idx][source_model_idx].items():
-                    base_key, base_val = base_kv[target_layer_idx]
-                    new_base_key = base_key[:, :, -new_length:, :]
-                    new_base_val = base_val[:, :, -new_length:, :]
+                entry = model.projector_dict[model.base_model_idx][source_model_idx][layer_idx]
+                base_key, base_val = base_kv[layer_idx]
+                new_base_key = base_key[:, :, -new_length:, :]
+                new_base_val = base_val[:, :, -new_length:, :]
+                
+                for source_layer_idx, projector_idx in entry:
+                    src_key, src_val = source_kv[source_layer_idx]
+                    new_src_key = src_key[:, :, -new_length:, :]
+                    new_src_val = src_val[:, :, -new_length:, :]
                     
-                    for source_layer_idx, projector_idx in entry:
-                        src_key, src_val = source_kv[source_layer_idx]
-                        new_src_key = src_key[:, :, -new_length:, :]
-                        new_src_val = src_val[:, :, -new_length:, :]
-                        
-                        proj_key, proj_val = model.projector_list[projector_idx].forward(
-                            (new_src_key, new_src_val),
-                            (new_base_key, new_base_val)
-                        )
-                    
-                    fused_kv.key_cache[target_layer_idx][:, :, -new_length:, :] = proj_key
-                    fused_kv.value_cache[target_layer_idx][:, :, -new_length:, :] = proj_val
+                    proj_key, _ = model.projector_list[projector_idx].forward(
+                        (new_src_key, new_src_val),
+                        (new_base_key, new_base_val)
+                    )
+                
+                fused_key[:, :, -new_length:, :] = proj_key
+                del proj_key
+            
+            # Free GPU KV caches immediately
+            del base_kv, source_kv, base_output, source_output
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        # Extract fused K cache for the target layer
-        k_value = fused_kv.key_cache[layer_idx].squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
+        # Move to CPU and flatten
+        k_value = fused_key.squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
+        del fused_key
         k_value_flat = k_value.permute(1, 0, 2).reshape(k_value.shape[1], -1)
         all_values.append(k_value_flat.numpy())
     
@@ -162,42 +163,20 @@ def extract_k_cache(model, tokenizer, dataset, layer_idx, num_samples=10):
         with torch.no_grad():
             output = model(**input, use_cache=True)
 
-        # (batch, num_heads, seq_len, head_dim)
-        k_value = output.past_key_values[layer_idx][0].squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
+        # Extract target layer K and move to CPU immediately
+        k_value = output.past_key_values[layer_idx][0].squeeze(0).float().cpu()
         
-        # For each token, flatten across heads and head_dim
-        # k_value: (num_heads, seq_len, head_dim) -> (seq_len, num_heads * head_dim)
-        k_value_flat = k_value.permute(1, 0, 2).reshape(k_value.shape[1], -1)  # (seq_len, num_heads * head_dim)
+        # Free all GPU tensors before accumulating
+        del output
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Add all tokens for this sample
+        k_value_flat = k_value.permute(1, 0, 2).reshape(k_value.shape[1], -1)
         all_values.append(k_value_flat.numpy())
+        del k_value
 
     return all_values
 
-def extract_v_cache(model, tokenizer, dataset, layer_idx, num_samples=20):
-    all_values = []
-    subset = [dataset[i] for i in range(0, min(num_samples, len(dataset)))]
-    for i, sample in enumerate(tqdm(subset, desc=f"Layer {layer_idx}")):
-        instruction = tokenizer.apply_chat_template(sample[:1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        input = tokenizer(instruction, return_tensors="pt", add_special_tokens=False).to(DEVICE)
-        instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(input['input_ids'].shape[1], 1).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            if isinstance(model, RosettaModel):
-                output = model(**input, kv_cache_index=[instruction_index], use_cache=True)
-            else:
-                output = model(**input, use_cache=True)
-
-        # (batch, num_heads, seq_len, head_dim)
-        v_value = output.past_key_values[layer_idx][1].squeeze(0).float().cpu()  # (num_heads, seq_len, head_dim)
-        
-        # For each token, flatten across heads and head_dim
-        # v_value: (num_heads, seq_len, head_dim) -> (seq_len, num_heads * head_dim)
-        v_value_flat = v_value.permute(1, 0, 2).reshape(v_value.shape[1], -1)  # (seq_len, num_heads * head_dim)
-        
-        # Add all tokens for this sample
-        all_values.append(v_value_flat.numpy())
-
-    return all_values
 
 def align_dimensions(all_embeddings, target_dim=None):
     """
@@ -225,6 +204,127 @@ def align_dimensions(all_embeddings, target_dim=None):
             pca.fit(all_tokens)
             aligned.append([pca.transform(arr) for arr in emb_list])
     return aligned
+
+
+import csv
+from scipy.special import rel_entr, softmax
+from scipy.spatial.distance import jensenshannon
+
+
+def kv_to_distribution(kv_list):
+    """
+    Convert list of KV cache arrays (per-sample) into a single probability
+    distribution by concatenating all tokens and applying softmax over the
+    feature dimension for each token, then averaging across tokens.
+    
+    Returns a 1-D probability distribution (sums to 1).
+    """
+    all_tokens = np.concatenate(kv_list, axis=0)  # (total_tokens, dim)
+    # Softmax per token to get per-token distributions
+    token_dists = softmax(all_tokens, axis=1)     # (total_tokens, dim)
+    # Average distribution across all tokens
+    avg_dist = token_dists.mean(axis=0)
+    # Re-normalize
+    avg_dist = avg_dist / avg_dist.sum()
+    return avg_dist
+
+
+def kl_divergence(p, q):
+    """KL(P || Q) with epsilon smoothing to avoid log(0)."""
+    eps = 1e-10
+    p = np.clip(p, eps, None)
+    q = np.clip(q, eps, None)
+    p = p / p.sum()
+    q = q / q.sum()
+    return float(np.sum(rel_entr(p, q)))
+
+
+def js_divergence(p, q):
+    """Jensen-Shannon divergence (square of JS distance from scipy)."""
+    eps = 1e-10
+    p = np.clip(p, eps, None)
+    q = np.clip(q, eps, None)
+    p = p / p.sum()
+    q = q / q.sum()
+    js_dist = jensenshannon(p, q)
+    return float(js_dist ** 2)
+
+
+def compute_divergences(k_cache_per_model, layers_to_analyze, layer_idx_offset_list,
+                        model_names, output_dir):
+    """
+    Compute KL and JS divergence between model pairs per layer mapping
+    and save as CSV.
+    
+    model_names order: [Rosetta, Qwen3-8B, Qwen2.5-7B-Instruct]
+    Pairs measured (base=Qwen3-8B perspective):
+      - 8B vs Rosetta
+      - 8B vs 7B
+      - Rosetta vs 7B
+    """
+    # Identify model indices by name
+    idx_map = {name: i for i, name in enumerate(model_names)}
+    r_idx = idx_map.get('Rosetta')
+    base_idx = idx_map.get('Qwen3-8B')
+    teacher_idx = idx_map.get('Qwen2.5-7B-Instruct')
+    
+    if any(v is None for v in [r_idx, base_idx, teacher_idx]):
+        print("Warning: Cannot compute divergences - need all 3 models (Rosetta, Qwen3-8B, Qwen2.5-7B-Instruct)")
+        return
+    
+    csv_path = os.path.join(output_dir, "kl_js_divergence.csv")
+    rows = []
+    
+    print(f"\n{'='*60}")
+    print("Computing KL / JS Divergence per layer...")
+    print(f"{'='*60}")
+    
+    for layer_idx in layers_to_analyze:
+        # Build layer mapping string: "base_layer -> teacher_layer"
+        teacher_actual = layer_idx + layer_idx_offset_list[model_names.index('Qwen2.5-7B-Instruct')]
+        mapping_str = f"{layer_idx} -> {teacher_actual}"
+        
+        # Align dimensions via PCA before computing divergences
+        emb_rosetta = k_cache_per_model[r_idx][layer_idx]
+        emb_base = k_cache_per_model[base_idx][layer_idx]
+        emb_teacher = k_cache_per_model[teacher_idx][layer_idx]
+        
+        aligned = align_dimensions([emb_rosetta, emb_base, emb_teacher])
+        
+        dist_r = kv_to_distribution(aligned[0])
+        dist_8b = kv_to_distribution(aligned[1])
+        dist_7b = kv_to_distribution(aligned[2])
+        
+        kl_8b_r = kl_divergence(dist_8b, dist_r)
+        kl_8b_7b = kl_divergence(dist_8b, dist_7b)
+        kl_r_7b = kl_divergence(dist_r, dist_7b)
+        
+        js_8b_r = js_divergence(dist_8b, dist_r)
+        js_8b_7b = js_divergence(dist_8b, dist_7b)
+        js_r_7b = js_divergence(dist_r, dist_7b)
+        
+        row = {
+            'layer_mapping': mapping_str,
+            'KL_8B-R': f"{kl_8b_r:.6f}",
+            'KL_8B-7B': f"{kl_8b_7b:.6f}",
+            'KL_R-7B': f"{kl_r_7b:.6f}",
+            'JS_8B-R': f"{js_8b_r:.6f}",
+            'JS_8B-7B': f"{js_8b_7b:.6f}",
+            'JS_R-7B': f"{js_r_7b:.6f}",
+        }
+        rows.append(row)
+        print(f"  Layer {mapping_str}: KL(8B||R)={kl_8b_r:.4f}  KL(8B||7B)={kl_8b_7b:.4f}  "
+              f"KL(R||7B)={kl_r_7b:.4f}  JS(8B,R)={js_8b_r:.4f}  JS(8B,7B)={js_8b_7b:.4f}  "
+              f"JS(R,7B)={js_r_7b:.4f}")
+    
+    # Write CSV
+    fieldnames = ['layer_mapping', 'KL_8B-R', 'KL_8B-7B', 'KL_R-7B', 'JS_8B-R', 'JS_8B-7B', 'JS_R-7B']
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    print(f"\nDivergence results saved to: {csv_path}")
 
 
 def plot_tsne_per_token(all_embeddings, label, model_names, layer_idx, output_path, show_correspondence=True):
@@ -444,7 +544,7 @@ def main(args):
     layer_idx_offset_list = [0, 0, -8]
 
     if args.get('mode', 'both') in ['sequence', 'both']:
-        num_samples = args.get('num_samples') or 100
+        num_samples = args.get('num_samples') or 50
     else:
         num_samples = args.get('num_samples') or 10
 
@@ -492,6 +592,15 @@ def main(args):
         if args.get('mode', 'both') in ['sequence', 'both']:
             plot_tsne_per_sequence(k_layer_embeddings, "k", args['models'], layer_idx, args['output_dir'], 
                                   args.get('show_correspondence', True))
+
+    # ---- Compute KL / JS Divergence ----
+    compute_divergences(
+        k_cache_per_model=k_cache_per_model,
+        layers_to_analyze=layers_to_analyze,
+        layer_idx_offset_list=layer_idx_offset_list,
+        model_names=args['models'],
+        output_dir=args['output_dir'],
+    )
 
 
 if __name__ == "__main__":
