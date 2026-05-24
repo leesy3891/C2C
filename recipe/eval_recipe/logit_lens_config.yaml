@@ -1,28 +1,48 @@
 # Logit Lens Analysis Config
-# Receiver: Qwen3-8B, Sharer: Qwen2.5-7B-Instruct
+# ─────────────────────────────────────────────────────────────
+# dataset / use_cot / subjects
+# ─────────────────────────────────────────────────────────────
 
 model:
   model_name: Rosetta
   rosetta_config:
-    base_model: Qwen/Qwen3-8B              # receiver (8B)
-    teacher_model: Qwen/Qwen2.5-7B-Instruct  # sharer (7B)
+    base_model: Qwen/Qwen3-8B                # receiver (8B)
+    teacher_model: Qwen/Qwen2.5-7B-Instruct  # sharer  (7B)
     is_do_alignment: true
     alignment_strategy: "longest"
     checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
 
   generation_config:
-    do_sample: false
-    max_new_tokens: 64
+    do_sample: true
+    max_new_tokens: 2048
 
 output:
   output_dir: local/final_results/logit_lens_analysis
 
 eval:
-  dataset: gpqa
+  # ── 데이터셋 선택 ──────────────────────────────────────────
+  # 지원: mmlu-redux, mmmlu, gpqa, math-500, gsm8k,
+  #       openbookqa, ai2-arc, mmlu-pro, ceval
+  dataset: gsm8k
+
+  # ── CoT (Chain-of-Thought) ────────────────────────────────
+  use_cot: true         # true → step-by-step reasoning prompt
+
+  # ── GPU / 샘플링 ─────────────────────────────────────────
   gpu_ids: [0]
-  answer_method: logits
-  use_cot: false
+  sample_interval: 1     # N번째 샘플마다 1개 선택 (2 = 절반)
+  start_index: 0          # 시작 인덱스
+  num_of_tasks: null      # 전체 분석할 task 수 제한 (null = 전체)
+                          # CLI --num_tasks 가 지정되면 CLI 우선
+
+  # ── 과목 필터 (null = 전체) ───────────────────────────────
+  subjects: null
+  # subjects: ["abstract_algebra", "anatomy"]   # 특정 과목만
+  # subjects: ["gpqa_diamond"]                   # GPQA
+  # subjects: ["main"]                           # GSM8K / OpenBookQA
+  # subjects: ["ARC-Challenge"]                  # AI2-ARC
+  # subjects: ["KO_KR", "JA_JP"]                # MMMLU 특정 언어
+
+  # ── 기타 ──────────────────────────────────────────────────
   use_template: true
-  sample_interval: 1
-  start_index: 0
-  num_of_tasks: null
+  answer_method: logits
