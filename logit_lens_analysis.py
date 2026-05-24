@@ -528,7 +528,7 @@ def main():
 
     # Print memory budget
     if torch.cuda.is_available():
-        total_mem = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        total_mem = torch.cuda.get_device_properties(device).total_memory / (1024**3)
         print(f"GPU {args.gpu}: {total_mem:.1f} GB total, budget: 49 GB")
 
     # Create analyzer
