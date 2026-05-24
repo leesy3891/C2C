@@ -1,0 +1,28 @@
+# Logit Lens Analysis Config
+# Receiver: Qwen3-8B, Sharer: Qwen2.5-7B-Instruct
+
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-8B              # receiver (8B)
+    teacher_model: Qwen/Qwen2.5-7B-Instruct  # sharer (7B)
+    is_do_alignment: true
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/C2C_Fuser/qwen3_8b+qwen2.5_7b_Fuser/final
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/logit_lens_analysis
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: logits
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  start_index: 0
+  num_of_tasks: null
