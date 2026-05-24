@@ -376,10 +376,11 @@ class LogitLensAnalyzer:
         from rosetta.model.wrapper import RosettaModel
         hook_handlers = []
         num_layers = self.receiver_model.config.num_hidden_layers
+        model_dtype = next(self.receiver_model.parameters()).dtype  # bfloat16
         for i in range(num_layers):
             attn = self.receiver_model.model.layers[i].self_attn
-            new_k = fused_kv.key_cache[i]
-            new_v = fused_kv.value_cache[i]
+            new_k = fused_kv.key_cache[i].to(dtype=model_dtype)
+            new_v = fused_kv.value_cache[i].to(dtype=model_dtype)
             try:
                 orig = RosettaModel._monkeypatch_qwen3_attention_forward(attn, new_k, new_v)
                 hook_handlers.append((attn, orig))
