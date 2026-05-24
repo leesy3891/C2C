@@ -1,16 +1,13 @@
 """
-Logit Lens Analysis for Receiver (8B) + Sharer (7B) Rosetta Model
+Logit Lens Analysis for Receiver + Sharer Rosetta Model
 
-Performs logit lens decoding at each layer of the receiver model,
-recording top-5 tokens and their logits per task per layer.
+Supports all datasets from unified_evaluator (mmlu-redux, mmmlu, gpqa,
+math-500, gsm8k, openbookqa, ai2-arc, mmlu-pro, ceval) and CoT toggle,
+all controlled via YAML config.
 
-Memory optimization strategy (target: < 49GB):
-  1. Load both models in bfloat16 (~15GB + ~14GB = ~29GB)
-  2. Run sharer prefill → KV cache, offload sharer to CPU (~14GB freed)
-  3. Run receiver with output_hidden_states=True for logit lens
-  4. Peak ~25GB well within 49GB budget
+Memory optimization: sharer offloaded to CPU after prefill (~25GB peak for 7B+8B).
 
-Output: CSV at ~C2C/resource/receiver_sharer_dataset.csv
+Output: CSV at <output_dir>/receiver_sharer_dataset.csv
 """
 
 import argparse
@@ -19,6 +16,8 @@ import gc
 import os
 import re
 import json
+import random
+import hashlib
 import torch
 import yaml
 import numpy as np
@@ -30,85 +29,417 @@ from transformers.cache_utils import DynamicCache
 from datasets import load_dataset
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, "r") as f:
+# ===================================================================== #
+#  Dataset configs (mirrored from unified_evaluator.py)                  #
+# ===================================================================== #
+DATASET_CONFIGS = {
+    "mmlu-redux": {
+        "hf_name": "edinburgh-dawg/mmlu-redux-2.0",
+        "split": "test",
+        "subjects": [
+            'abstract_algebra', 'anatomy', 'astronomy', 'business_ethics',
+            'clinical_knowledge', 'college_biology', 'college_chemistry',
+            'college_computer_science', 'college_mathematics', 'college_medicine',
+            'college_physics', 'computer_security', 'conceptual_physics',
+            'econometrics', 'electrical_engineering', 'elementary_mathematics',
+            'formal_logic', 'global_facts', 'high_school_biology',
+            'high_school_chemistry', 'high_school_computer_science',
+            'high_school_european_history', 'high_school_geography',
+            'high_school_government_and_politics', 'high_school_macroeconomics',
+            'high_school_mathematics', 'high_school_microeconomics',
+            'high_school_physics', 'high_school_psychology',
+            'high_school_statistics', 'high_school_us_history',
+            'high_school_world_history', 'human_aging', 'human_sexuality',
+            'international_law', 'jurisprudence', 'logical_fallacies',
+            'machine_learning', 'management', 'marketing', 'medical_genetics',
+            'miscellaneous', 'moral_disputes', 'moral_scenarios', 'nutrition',
+            'philosophy', 'prehistory', 'professional_accounting',
+            'professional_law', 'professional_medicine',
+            'professional_psychology', 'public_relations', 'security_studies',
+            'sociology', 'us_foreign_policy', 'virology', 'world_religions',
+        ],
+        "type": "mcq",       # multiple-choice question
+    },
+    "mmmlu": {
+        "hf_name": "openai/MMMLU",
+        "split": "test",
+        "subjects": [
+            'AR_XY', 'BN_BD', 'DE_DE', 'ES_LA', 'FR_FR', 'HI_IN',
+            'ID_ID', 'IT_IT', 'JA_JP', 'KO_KR', 'PT_BR', 'SW_KE',
+            'YO_NG', 'ZH_CN',
+        ],
+        "type": "mcq",
+    },
+    "gpqa": {
+        "hf_name": "Idavidrein/gpqa",
+        "split": "train",
+        "subjects": ["gpqa_diamond"],
+        "type": "mcq",
+    },
+    "math-500": {
+        "hf_name": "HuggingFaceH4/MATH-500",
+        "split": "test",
+        "subjects": ["all"],
+        "type": "open",       # open-ended generation
+    },
+    "gsm8k": {
+        "hf_name": "openai/gsm8k",
+        "split": "test",
+        "subjects": ["main"],
+        "type": "open",
+    },
+    "openbookqa": {
+        "hf_name": "openbookqa",
+        "split": "test",
+        "subjects": ["main"],
+        "type": "mcq",
+    },
+    "ai2-arc": {
+        "hf_name": "allenai/ai2_arc",
+        "split": "test",
+        "subjects": ["ARC-Challenge"],
+        "type": "mcq",
+    },
+    "mmlu-pro": {
+        "hf_name": "TIGER-Lab/MMLU-Pro",
+        "split": "test",
+        "subjects": ["main"],
+        "type": "mcq",
+    },
+    "ceval": {
+        "hf_name": "ceval/ceval-exam",
+        "split": "test",
+        "subjects": [
+            "accountant", "advanced_mathematics", "art_studies",
+            "basic_medicine", "business_administration",
+            "chinese_language_and_literature", "civil_servant",
+            "clinical_medicine", "college_chemistry", "college_economics",
+            "college_physics", "college_programming",
+            "computer_architecture", "computer_network",
+            "discrete_mathematics", "education_science",
+            "electrical_engineer",
+            "environmental_impact_assessment_engineer", "fire_engineer",
+            "high_school_biology", "high_school_chemistry",
+            "high_school_chinese", "high_school_geography",
+            "high_school_history", "high_school_mathematics",
+            "high_school_physics", "high_school_politics",
+            "ideological_and_moral_cultivation", "law",
+            "legal_professional", "logic", "mao_zedong_thought",
+            "marxism", "metrology_engineer", "middle_school_biology",
+            "middle_school_chemistry", "middle_school_geography",
+            "middle_school_history", "middle_school_mathematics",
+            "middle_school_physics", "middle_school_politics",
+            "modern_chinese_history", "operating_system", "physician",
+            "plant_protection", "probability_and_statistics",
+            "professional_tour_guide", "sports_science",
+            "tax_accountant", "teacher_qualification",
+            "urban_and_rural_planner", "veterinary_medicine",
+        ],
+        "type": "mcq",
+    },
+}
+
+
+# ===================================================================== #
+#  Prompt builders                                                       #
+# ===================================================================== #
+
+def build_mcq_prompt(question: str, choices: str, use_cot: bool) -> str:
+    """MCQ prompt for MMLU-family / GPQA / ARC / OpenBookQA / ceval."""
+    if use_cot:
+        tpl = (
+            "Accurately answer the following question:\n\n"
+            "{{question}}\n\n"
+            "Choices:\n{{choices}}\n"
+            "Instructions:\n"
+            "- Carefully read the question and all options.\n"
+            "- Let's think step by step and explain your reasoning briefly.\n"
+            "- Then give the final answer starting with The correct answer is"
+        )
+    else:
+        tpl = (
+            "Accurately answer the following question:\n\n"
+            "{{question}}\n\n"
+            "Choices:\n{{choices}}\n"
+            "Instructions:\n"
+            "- Carefully read the question and all options.\n"
+            "- Select the single most correct answer.\n"
+            '- Respond ONLY in the following format: "The correct answer is A/B/C/D".\n'
+            "- Do not include any explanations, additional text, or punctuation besides the answer.\n\n"
+            "The correct answer is"
+        )
+    return tpl.replace("{{question}}", question).replace("{{choices}}", choices)
+
+
+def build_math_prompt(question: str, use_cot: bool) -> str:
+    """Open-ended math prompt for MATH-500 / GSM8K."""
+    if use_cot:
+        return (
+            "Solve the following math problem step by step. The last line of "
+            "your response should be of the form Answer: $ANSWER (without quotes) "
+            "where $ANSWER is the answer to the problem.\n\n"
+            f"{question}\n\n"
+            "Please think step by step and explain your reasoning. Remember to "
+            'put your answer on its own line after "Answer:", and you do not '
+            "need to use a \\boxed command."
+        )
+    else:
+        return (
+            "Solve the following math problem.\n\n"
+            f"{question}\n\n"
+            "Answer:"
+        )
+
+
+# ===================================================================== #
+#  Example formatting per dataset                                        #
+# ===================================================================== #
+
+def _prepare_gpqa_item(example: Dict) -> Dict:
+    """Deterministic shuffle for GPQA options."""
+    def pick(pk, rk):
+        rv = example.get(rk)
+        return str(rv) if rv is not None and str(rv).strip() else str(example.get(pk, ""))
+
+    q = pick("Question", "Extra Revised Question")
+    correct = pick("Correct Answer", "Extra Revised Correct Answer")
+    inc = [pick(f"Incorrect Answer {i}", f"Extra Revised Incorrect Answer {i}") for i in range(1, 4)]
+    all_c = [correct] + inc
+    seed = int(hashlib.md5("||".join([q] + all_c).encode()).hexdigest(), 16) % (2**32)
+    rng = random.Random(seed)
+    idx = list(range(4)); rng.shuffle(idx)
+    shuffled = [all_c[i] for i in idx]
+    return {"question": q, "choices": shuffled, "answer": shuffled.index(correct)}
+
+
+def format_example(dataset_name: str, example: Dict, use_cot: bool,
+                   subject: str = "") -> Optional[str]:
+    """
+    Format a single example into a prompt string.
+    Returns None if the example should be skipped.
+    """
+    if dataset_name == "mmlu-redux":
+        err = example.get("error_type", "")
+        if err in ("no_correct_answer", "expert"):
+            return None
+        choices = "".join(f"{chr(65+i)}. {c}\n" for i, c in enumerate(example["choices"]))
+        return build_mcq_prompt(example["question"], choices, use_cot)
+
+    elif dataset_name == "mmmlu":
+        q = example["Question"]
+        choices = "".join(f"{k}. {example[k]}\n" for k in ("A", "B", "C", "D") if k in example)
+        return build_mcq_prompt(q, choices, use_cot)
+
+    elif dataset_name == "gpqa":
+        prep = _prepare_gpqa_item(example)
+        choices = "".join(f"{chr(65+i)}. {c}\n" for i, c in enumerate(prep["choices"]))
+        return build_mcq_prompt(prep["question"], choices, use_cot)
+
+    elif dataset_name in ("math-500",):
+        return build_math_prompt(example.get("problem", ""), use_cot)
+
+    elif dataset_name == "gsm8k":
+        return build_math_prompt(example.get("question", ""), use_cot)
+
+    elif dataset_name == "openbookqa":
+        q = example.get("question_stem", "")
+        raw = example.get("choices", {})
+        texts = list(raw.get("text", [])) if isinstance(raw, dict) else [
+            str(x.get("text", x) if isinstance(x, dict) else x) for x in raw
+        ]
+        choices = "".join(f"{chr(65+i)}. {t}\n" for i, t in enumerate(texts))
+        return build_mcq_prompt(q, choices, use_cot)
+
+    elif dataset_name == "ai2-arc":
+        q = example.get("question", "")
+        raw = example.get("choices", {})
+        texts = list(raw.get("text", [])) if isinstance(raw, dict) else [
+            str(x.get("text", x) if isinstance(x, dict) else x) for x in raw
+        ]
+        choices = "".join(f"{chr(65+i)}. {t}\n" for i, t in enumerate(texts))
+        return build_mcq_prompt(q, choices, use_cot)
+
+    elif dataset_name == "mmlu-pro":
+        q = example.get("question", "")
+        opts = example.get("options", [])
+        choices = "".join(f"{chr(65+i)}. {o}\n" for i, o in enumerate(opts[:10]))
+        return build_mcq_prompt(q, choices, use_cot)
+
+    elif dataset_name == "ceval":
+        q = example.get("question", "")
+        choices = "".join(f"{k}. {example.get(k, '')}\n"
+                          for k in ("A", "B", "C", "D") if example.get(k))
+        return build_mcq_prompt(q, choices, use_cot)
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def get_ground_truth(dataset_name: str, example: Dict, subject: str = "") -> Optional[str]:
+    """Extract the ground-truth answer string from an example."""
+    if dataset_name == "mmlu-redux":
+        err = example.get("error_type", "")
+        if err == "wrong_groundtruth" and example.get("correct_answer") is not None:
+            a = example["correct_answer"]
+            return chr(65 + int(a)) if a in "0123" else a
+        return chr(65 + int(example["answer"]))
+
+    elif dataset_name == "mmmlu":
+        a = example.get("Answer")
+        if isinstance(a, int): return chr(65 + a)
+        if isinstance(a, str) and a in "0123": return chr(65 + int(a))
+        if isinstance(a, str) and a in "ABCD": return a
+        return None
+
+    elif dataset_name == "gpqa":
+        prep = _prepare_gpqa_item(example)
+        return chr(65 + int(prep["answer"]))
+
+    elif dataset_name == "math-500":
+        return str(example.get("answer", "")).strip() or None
+
+    elif dataset_name == "gsm8k":
+        full = str(example.get("answer", ""))
+        if "####" in full:
+            tail = full.split("####")[-1].strip()
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", tail)
+            return m.group(0) if m else tail
+        return None
+
+    elif dataset_name == "openbookqa":
+        return example.get("answerKey")
+
+    elif dataset_name == "ai2-arc":
+        ak = example.get("answerKey", "")
+        if ak in "12345":
+            return chr(64 + int(ak))
+        return ak if ak in "ABCDE" else None
+
+    elif dataset_name == "mmlu-pro":
+        return example.get("answer")
+
+    elif dataset_name == "ceval":
+        return example.get("answer")
+
+    return None
+
+
+def extract_prediction(dataset_name: str, text: str) -> Optional[str]:
+    """
+    Extract predicted answer from generated text.
+    MCQ datasets → look for A/B/C/D letter.
+    Math datasets → look for numerical answer.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    ds_type = DATASET_CONFIGS.get(dataset_name, {}).get("type", "mcq")
+
+    if ds_type == "mcq":
+        # Try "correct answer is X" patterns first
+        for pat in [
+            r'(?:correct answer|answer)\s*(?:is|:)\s*([A-J])',
+            r'\b([A-J])(?:\s*[.,!?:)]?\s*$)',
+            r'(?:^|\s)([A-J])\s*$',
+        ]:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return m.group(1).upper()
+        # Fallback: last A-D letter
+        letters = re.findall(r'\b([A-D])\b', text)
+        return letters[-1].upper() if letters else None
+
+    else:  # open (math)
+        # Look for "Answer: <value>"
+        m = re.search(r'[Aa]nswer\s*:\s*(.+)', text)
+        if m:
+            val = m.group(1).strip().rstrip(".")
+            num = re.search(r"[-+]?\d+(?:,\d+)*(?:\.\d+)?", val)
+            return num.group(0).replace(",", "") if num else val
+        # Fallback: last number in text
+        nums = re.findall(r"[-+]?\d+(?:,\d+)*(?:\.\d+)?", text)
+        return nums[-1].replace(",", "") if nums else None
+
+
+def judge_correct(dataset_name: str, pred: Optional[str],
+                  gt: Optional[str]) -> Optional[bool]:
+    """Compare prediction with ground truth. Returns None if either is missing."""
+    if pred is None or gt is None:
+        return None
+    ds_type = DATASET_CONFIGS.get(dataset_name, {}).get("type", "mcq")
+    if ds_type == "mcq":
+        return pred.strip().upper() == gt.strip().upper()
+    else:
+        # Numeric comparison for math
+        try:
+            return abs(float(pred) - float(gt)) < 1e-5
+        except (ValueError, TypeError):
+            return pred.strip() == gt.strip()
+
+
+# ===================================================================== #
+#  Utilities                                                             #
+# ===================================================================== #
+
+def load_config(path: str) -> Dict:
+    with open(path) as f:
         return yaml.safe_load(f)
 
-
-def clone_kv_cache(kv_cache: DynamicCache) -> DynamicCache:
-    new_cache = DynamicCache()
-    for k, v in zip(kv_cache.key_cache, kv_cache.value_cache):
-        new_cache.key_cache.append(k.clone().detach())
-        new_cache.value_cache.append(v.clone().detach())
-    return new_cache
-
+def clone_kv_cache(kv: DynamicCache) -> DynamicCache:
+    c = DynamicCache()
+    for k, v in zip(kv.key_cache, kv.value_cache):
+        c.key_cache.append(k.clone().detach())
+        c.value_cache.append(v.clone().detach())
+    return c
 
 def hybrid_to_dynamic(cache):
-    """Convert HybridCache to DynamicCache if needed."""
     if cache is None or isinstance(cache, DynamicCache):
         return cache
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
-        keys = cache.key_cache
-        values = cache.value_cache
-        legacy_cache = [(k, v) for k, v in zip(keys, values)]
-        return DynamicCache.from_legacy_cache(legacy_cache)
+        return DynamicCache.from_legacy_cache(list(zip(cache.key_cache, cache.value_cache)))
     raise TypeError(f"Unsupported cache type: {type(cache)}")
 
-
-def build_prompt(question: str, choices: str) -> str:
-    template = """Accurately answer the following question:
-
-{{question}}
-
-Choices:
-{{choices}}
-
-Instructions:
-- Carefully read the question and all options.
-- Select the single most correct answer.
-- Respond ONLY in the following format: "The correct answer is A/B/C/D".
-- Do not include any explanations, additional text, or punctuation besides the answer.
-
-The correct answer is"""
-    return template.replace("{{question}}", question).replace("{{choices}}", choices)
+def gpu_gb():
+    return torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
 
 
-def get_memory_usage_gb():
-    if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / (1024**3)
-    return 0.0
-
+# ===================================================================== #
+#  Analyzer                                                              #
+# ===================================================================== #
 
 class LogitLensAnalyzer:
-    def __init__(self, config: Dict[str, Any], device: torch.device):
+    def __init__(self, config: Dict, device: torch.device):
         self.config = config
         self.device = device
         self.model_config = config["model"]
-        self.eval_config = config["eval"]
+        self.eval_config  = config["eval"]
 
-        rosetta_cfg = self.model_config["rosetta_config"]
-        self.receiver_path = rosetta_cfg["base_model"]       # 8B receiver
-        self.sharer_path = rosetta_cfg["teacher_model"]       # 7B sharer
-        self.checkpoint_dir = rosetta_cfg["checkpoints_dir"]
-        self.is_do_alignment = rosetta_cfg.get("is_do_alignment", False)
-        self.alignment_strategy = rosetta_cfg.get("alignment_strategy", "longest")
+        rcfg = self.model_config["rosetta_config"]
+        self.receiver_path  = rcfg["base_model"]
+        self.sharer_path    = rcfg["teacher_model"]
+        self.checkpoint_dir = rcfg["checkpoints_dir"]
+        self.is_do_alignment    = rcfg.get("is_do_alignment", False)
+        self.alignment_strategy = rcfg.get("alignment_strategy", "longest")
 
-        self.receiver_model = None
-        self.sharer_model = None
-        self.receiver_tokenizer = None
-        self.sharer_tokenizer = None
+        # Dataset / CoT from eval config
+        self.dataset_name = self.eval_config.get("dataset", "mmlu-redux")
+        self.use_cot      = self.eval_config.get("use_cot", False)
+
+        self.receiver_model = self.sharer_model = None
+        self.receiver_tokenizer = self.sharer_tokenizer = None
         self.projector_list = []
         self.projector_dict = {}
         self.aligner = None
 
+    # ---- model loading ----
     def load_models(self):
-        print(f"[Memory] Before loading: {get_memory_usage_gb():.2f} GB")
+        print(f"[Mem] start: {gpu_gb():.2f} GB")
+        from rosetta.utils.evaluate import set_default_chat_template
 
-        # --- Tokenizers ---
         self.receiver_tokenizer = AutoTokenizer.from_pretrained(self.receiver_path)
         if self.receiver_tokenizer.pad_token is None:
             self.receiver_tokenizer.pad_token = self.receiver_tokenizer.eos_token
-        from rosetta.utils.evaluate import set_default_chat_template
         set_default_chat_template(self.receiver_tokenizer, self.receiver_path)
 
         self.sharer_tokenizer = AutoTokenizer.from_pretrained(self.sharer_path)
@@ -116,7 +447,6 @@ class LogitLensAnalyzer:
             self.sharer_tokenizer.pad_token = self.sharer_tokenizer.eos_token
         set_default_chat_template(self.sharer_tokenizer, self.sharer_path)
 
-        # --- Aligner (if alignment enabled) ---
         if self.is_do_alignment:
             from rosetta.model.aligner import TokenAligner, AlignmentStrategy
             self.aligner = TokenAligner(
@@ -124,388 +454,351 @@ class LogitLensAnalyzer:
                 llm_tokenizer=self.sharer_tokenizer,
                 strategy=AlignmentStrategy(self.alignment_strategy),
             )
-            print(f"Token aligner initialized with strategy: {self.alignment_strategy}")
 
-        # --- Receiver (8B) ---
         print(f"Loading receiver: {self.receiver_path}")
         self.receiver_model = AutoModelForCausalLM.from_pretrained(
-            self.receiver_path,
-            torch_dtype=torch.bfloat16,
-            device_map={"": self.device},
-            low_cpu_mem_usage=True,
-        ).eval()
-        print(f"[Memory] After receiver: {get_memory_usage_gb():.2f} GB")
+            self.receiver_path, torch_dtype=torch.bfloat16,
+            device_map={"": self.device}, low_cpu_mem_usage=True).eval()
+        print(f"[Mem] +receiver: {gpu_gb():.2f} GB")
 
-        # --- Sharer (7B) ---
         print(f"Loading sharer: {self.sharer_path}")
         self.sharer_model = AutoModelForCausalLM.from_pretrained(
-            self.sharer_path,
-            torch_dtype=torch.bfloat16,
-            device_map={"": self.device},
-            low_cpu_mem_usage=True,
-        ).eval()
-        print(f"[Memory] After sharer: {get_memory_usage_gb():.2f} GB")
+            self.sharer_path, torch_dtype=torch.bfloat16,
+            device_map={"": self.device}, low_cpu_mem_usage=True).eval()
+        print(f"[Mem] +sharer: {gpu_gb():.2f} GB")
 
-        # --- Projectors ---
         self._load_projectors()
-        print(f"[Memory] After projectors: {get_memory_usage_gb():.2f} GB")
+        print(f"[Mem] +proj: {gpu_gb():.2f} GB")
 
     def _load_projectors(self):
         from rosetta.model.projector import load_projector
-
-        checkpoint_dir = self.checkpoint_dir
-        num_projectors = len([f for f in os.listdir(checkpoint_dir)
-                              if re.match(r"projector_\d+\.pt", f)])
-
+        d = self.checkpoint_dir
+        n = len([f for f in os.listdir(d) if re.match(r"projector_\d+\.pt", f)])
         self.projector_list = []
-        for t in range(num_projectors):
-            json_cfg = os.path.join(checkpoint_dir, f"projector_{t}.json")
-            proj = load_projector(json_cfg)
-            proj = proj.to(device=self.device, dtype=torch.bfloat16)
-            pt_path = os.path.join(checkpoint_dir, f"projector_{t}.pt")
-            if os.path.exists(pt_path):
-                state_dict = torch.load(pt_path, map_location=self.device)
-                proj.load_state_dict(state_dict, strict=False)
-            proj.eval()
-            self.projector_list.append(proj)
-
-        proj_cfg_path = os.path.join(checkpoint_dir, "projector_config.json")
-        if os.path.exists(proj_cfg_path):
-            with open(proj_cfg_path, "r") as f:
-                raw = json.load(f)
-            self.projector_dict = self._convert_dict_keys_to_ints(raw)
-        print(f"Loaded {num_projectors} projectors, mapping: {self.projector_dict}")
+        for t in range(n):
+            p = load_projector(os.path.join(d, f"projector_{t}.json"))
+            p = p.to(device=self.device, dtype=torch.bfloat16)
+            pt = os.path.join(d, f"projector_{t}.pt")
+            if os.path.exists(pt):
+                p.load_state_dict(torch.load(pt, map_location=self.device), strict=False)
+            p.eval(); self.projector_list.append(p)
+        cfg = os.path.join(d, "projector_config.json")
+        if os.path.exists(cfg):
+            with open(cfg) as f: raw = json.load(f)
+            self.projector_dict = self._ints(raw)
+        print(f"Loaded {n} projectors")
 
     @staticmethod
-    def _convert_dict_keys_to_ints(obj):
+    def _ints(obj):
         if isinstance(obj, dict):
-            return {
-                (int(k) if isinstance(k, str) and k.lstrip('-').isdigit() else k):
-                LogitLensAnalyzer._convert_dict_keys_to_ints(v)
-                for k, v in obj.items()
-            }
+            return {(int(k) if isinstance(k, str) and k.lstrip('-').isdigit() else k):
+                    LogitLensAnalyzer._ints(v) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [LogitLensAnalyzer._convert_dict_keys_to_ints(v) for v in obj]
+            return [LogitLensAnalyzer._ints(v) for v in obj]
         return obj
 
-    def offload_sharer_to_cpu(self):
+    def _offload_sharer(self):
         if self.sharer_model is not None:
-            self.sharer_model.to("cpu")
-            torch.cuda.empty_cache()
-            gc.collect()
+            self.sharer_model.to("cpu"); torch.cuda.empty_cache(); gc.collect()
 
-    def reload_sharer_to_gpu(self):
+    def _reload_sharer(self):
         if self.sharer_model is not None:
             self.sharer_model.to(self.device)
 
-    # ------------------------------------------------------------------ #
-    #  Tokenization: produce aligned receiver_ids / sharer_ids of same L  #
-    # ------------------------------------------------------------------ #
+    # ---- tokenization (alignment-aware) ----
     def tokenize_prompt(self, prompt: str):
-        """
-        Tokenize a prompt for both receiver and sharer.
-        If alignment is enabled, returns padded ids of identical length.
-
-        Returns dict with keys:
-            receiver_ids   (1, L)   on device
-            receiver_mask  (1, L)   on device
-            sharer_ids     (1, L)   on device
-            sharer_mask    (1, L)   on device
-        """
         messages = [{"role": "user", "content": prompt}]
 
-        if self.aligner is not None:
-            # Use aligner to produce padded, equal-length ids
+        # Determine response_text based on dataset type and CoT
+        ds_type = DATASET_CONFIGS.get(self.dataset_name, {}).get("type", "mcq")
+        if self.use_cot:
+            # CoT: use generate mode, no suffix appended
+            response_text = None
+        elif ds_type == "mcq":
             response_text = "The correct answer is"
-            messages_with_resp = messages + [{"role": "assistant", "content": response_text}]
+        else:
+            response_text = "Answer:"
+
+        if self.aligner is not None:
+            if response_text is not None:
+                msgs = messages + [{"role": "assistant", "content": response_text}]
+                add_gen = False; remove_last = True
+            else:
+                msgs = messages
+                add_gen = True; remove_last = False
 
             details = self.aligner.align_chat_messages(
-                messages_with_resp,
-                add_generation_prompt=False,
-                return_details=True,
-                enable_thinking=False,
-                remove_last_surfix=True,
-            )
+                msgs, add_generation_prompt=add_gen, return_details=True,
+                enable_thinking=False, remove_last_surfix=remove_last)
 
-            receiver_ids = torch.tensor(details['slm_ids_padded']).unsqueeze(0).to(self.device)
-            sharer_ids   = torch.tensor(details['llm_ids_padded']).unsqueeze(0).to(self.device)
-
-            slm_pad_mask = torch.tensor(details['slm_padding_mask']).unsqueeze(0)
-            llm_pad_mask = torch.tensor(details['llm_padding_mask']).unsqueeze(0)
-
-            receiver_mask = (~slm_pad_mask).float().to(self.device)
-            sharer_mask   = (~llm_pad_mask).float().to(self.device)
-
-            assert receiver_ids.shape == sharer_ids.shape, \
-                f"Aligned lengths differ: {receiver_ids.shape} vs {sharer_ids.shape}"
-
+            r_ids = torch.tensor(details['slm_ids_padded']).unsqueeze(0).to(self.device)
+            s_ids = torch.tensor(details['llm_ids_padded']).unsqueeze(0).to(self.device)
+            r_mask = (~torch.tensor(details['slm_padding_mask']).unsqueeze(0)).float().to(self.device)
+            s_mask = (~torch.tensor(details['llm_padding_mask']).unsqueeze(0)).float().to(self.device)
+            assert r_ids.shape == s_ids.shape
         else:
-            # No alignment: same text, same tokenizer for both
             text = self.receiver_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            text += "The correct answer is"
-
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            if response_text is not None:
+                text += response_text
             tok = self.receiver_tokenizer(text, return_tensors="pt").to(self.device)
-            receiver_ids  = tok["input_ids"]
-            receiver_mask = tok["attention_mask"].float()
-            sharer_ids    = receiver_ids.clone()
-            sharer_mask   = receiver_mask.clone()
+            r_ids = tok["input_ids"]; r_mask = tok["attention_mask"].float()
+            s_ids = r_ids.clone(); s_mask = r_mask.clone()
 
-        return {
-            "receiver_ids":  receiver_ids,
-            "receiver_mask": receiver_mask,
-            "sharer_ids":    sharer_ids,
-            "sharer_mask":   sharer_mask,
-        }
+        return {"receiver_ids": r_ids, "receiver_mask": r_mask,
+                "sharer_ids": s_ids, "sharer_mask": s_mask}
 
-    # ------------------------------------------------------------------ #
-    #  Logit Lens: hidden_state → norm → lm_head → top-k                 #
-    # ------------------------------------------------------------------ #
+    # ---- logit lens ----
     @torch.no_grad()
-    def logit_lens_decode(self, hidden_states: List[torch.Tensor],
-                          top_k: int = 5) -> List[List[Tuple[str, float]]]:
-        norm    = self.receiver_model.model.norm
+    def logit_lens_decode(self, hidden_states, top_k=5):
+        norm = self.receiver_model.model.norm
         lm_head = self.receiver_model.lm_head
-
         results = []
         for h in hidden_states:
-            h_last  = h[:, -1:, :]
-            logits  = lm_head(norm(h_last))[0, 0].float()
+            logits = lm_head(norm(h[:, -1:, :]))[0, 0].float()
             vals, ids = torch.topk(logits, top_k)
-            layer_result = [
-                (self.receiver_tokenizer.decode([idx]), round(val, 3))
-                for val, idx in zip(vals.tolist(), ids.tolist())
-            ]
-            results.append(layer_result)
+            results.append([
+                (self.receiver_tokenizer.decode([i]), round(v, 3))
+                for v, i in zip(vals.tolist(), ids.tolist())])
         return results
 
-    # ------------------------------------------------------------------ #
-    #  Single-task pipeline                                               #
-    # ------------------------------------------------------------------ #
+    # ---- single task ----
     @torch.no_grad()
     def run_single_task(self, prompt: str, task_id: int):
         """
-        1. Tokenize (aligned)
-        2. Sharer prefill → KV cache → offload sharer
-        3. Receiver forward (output_hidden_states=True)
-        4. Apply projector to receiver KV cache using sharer KV
-        5. Re-run receiver with fused KV cache + output_hidden_states
-        6. Logit lens on all hidden states
+        Returns:
+            logit_lens_results: list of top-5 per layer
+            generated_text: str — model's greedy-decoded answer
         """
         tok = self.tokenize_prompt(prompt)
-        receiver_ids  = tok["receiver_ids"]
-        receiver_mask = tok["receiver_mask"]
-        sharer_ids    = tok["sharer_ids"]
-        sharer_mask   = tok["sharer_mask"]
-        seq_len       = receiver_ids.shape[1]
+        r_ids, r_mask = tok["receiver_ids"], tok["receiver_mask"]
+        s_ids, s_mask = tok["sharer_ids"],   tok["sharer_mask"]
 
-        # ---- 1. Sharer prefill (GPU) ----
-        self.reload_sharer_to_gpu()
-        sharer_out = self.sharer_model.forward(
-            input_ids=sharer_ids,
-            attention_mask=sharer_mask,
-            use_cache=True,
-            output_hidden_states=False,
-        )
-        sharer_kv = hybrid_to_dynamic(sharer_out.past_key_values)
+        # 1) Sharer prefill
+        self._reload_sharer()
+        s_out = self.sharer_model(input_ids=s_ids, attention_mask=s_mask,
+                                  use_cache=True, output_hidden_states=False)
+        s_kv = hybrid_to_dynamic(s_out.past_key_values)
+        s_kv_cpu = DynamicCache()
+        for k, v in zip(s_kv.key_cache, s_kv.value_cache):
+            s_kv_cpu.key_cache.append(k.cpu()); s_kv_cpu.value_cache.append(v.cpu())
+        del s_out, s_kv; torch.cuda.empty_cache()
 
-        # Copy sharer KV to CPU
-        sharer_kv_cpu = DynamicCache()
-        for k, v in zip(sharer_kv.key_cache, sharer_kv.value_cache):
-            sharer_kv_cpu.key_cache.append(k.cpu())
-            sharer_kv_cpu.value_cache.append(v.cpu())
-        del sharer_out, sharer_kv
-        torch.cuda.empty_cache()
+        # 2) Offload sharer
+        self._offload_sharer()
 
-        # ---- 2. Offload sharer ----
-        self.offload_sharer_to_cpu()
+        # 3) Receiver forward
+        pos = r_mask.long().cumsum(-1) - 1
+        r_out = self.receiver_model(input_ids=r_ids, attention_mask=r_mask,
+                                    position_ids=pos, use_cache=True,
+                                    output_hidden_states=True)
+        baseline = [h.detach() for h in r_out.hidden_states]
+        r_kv = hybrid_to_dynamic(r_out.past_key_values)
 
-        # ---- 3. Receiver forward (with hidden states) ----
-        position_ids = receiver_mask.long().cumsum(-1) - 1
-        receiver_out = self.receiver_model.forward(
-            input_ids=receiver_ids,
-            attention_mask=receiver_mask,
-            position_ids=position_ids,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        baseline_hidden = [h.detach() for h in receiver_out.hidden_states]
-        receiver_kv = hybrid_to_dynamic(receiver_out.past_key_values)
+        # 4) Projector
+        s_kv_gpu = DynamicCache()
+        for k, v in zip(s_kv_cpu.key_cache, s_kv_cpu.value_cache):
+            s_kv_gpu.key_cache.append(k.to(self.device))
+            s_kv_gpu.value_cache.append(v.to(self.device))
+        del s_kv_cpu
 
-        # ---- 4. Apply projector: modify receiver KV with sharer KV ----
-        # Move sharer KV back to GPU
-        sharer_kv_gpu = DynamicCache()
-        for k, v in zip(sharer_kv_cpu.key_cache, sharer_kv_cpu.value_cache):
-            sharer_kv_gpu.key_cache.append(k.to(self.device))
-            sharer_kv_gpu.value_cache.append(v.to(self.device))
-        del sharer_kv_cpu
+        fused = clone_kv_cache(r_kv)
+        if 0 in self.projector_dict and 1 in self.projector_dict.get(0, {}):
+            for tl, entry in self.projector_dict[0][1].items():
+                tgt_kv = (fused.key_cache[tl], fused.value_cache[tl])
+                for sl, pi in entry:
+                    src_kv = (s_kv_gpu.key_cache[sl], s_kv_gpu.value_cache[sl])
+                    pk, pv = self.projector_list[pi](src_kv, tgt_kv)
+                    fused.key_cache[tl] = pk; fused.value_cache[tl] = pv
+                    tgt_kv = (pk, pv)
+        del s_kv_gpu; torch.cuda.empty_cache()
 
-        fused_kv = clone_kv_cache(receiver_kv)
-        base_idx, source_idx = 0, 1
-
-        if base_idx in self.projector_dict and \
-           source_idx in self.projector_dict.get(base_idx, {}):
-            for target_layer, entry in self.projector_dict[base_idx][source_idx].items():
-                # Receiver (target) KV: (B, H_recv, N, D) from fused_kv
-                recv_key  = fused_kv.key_cache[target_layer]     # (B, H_r, N, D)
-                recv_val  = fused_kv.value_cache[target_layer]   # (B, H_r, N, D)
-                target_kv = (recv_key, recv_val)
-
-                for source_layer, proj_idx in entry:
-                    # Sharer (source) KV: (B, H_shr, N, D) from sharer_kv_gpu
-                    shr_key = sharer_kv_gpu.key_cache[source_layer]   # (B, H_s, N, D)
-                    shr_val = sharer_kv_gpu.value_cache[source_layer] # (B, H_s, N, D)
-                    source_kv = (shr_key, shr_val)
-
-                    proj_key, proj_val = self.projector_list[proj_idx].forward(
-                        source_kv, target_kv
-                    )
-
-                    fused_kv.key_cache[target_layer]  = proj_key
-                    fused_kv.value_cache[target_layer] = proj_val
-                    # Update target_kv for next source in same target layer
-                    target_kv = (proj_key, proj_val)
-
-        del sharer_kv_gpu
-        torch.cuda.empty_cache()
-
-        # ---- 5. Re-run receiver with fused KV cache ----
-        # Monkeypatch attention layers to use fused KV, then forward for hidden states
+        # 5) Re-run with fused KV for logit lens
         from rosetta.model.wrapper import RosettaModel
-        hook_handlers = []
-        num_layers = self.receiver_model.config.num_hidden_layers
-        model_dtype = next(self.receiver_model.parameters()).dtype  # bfloat16
-        for i in range(num_layers):
+        mdtype = next(self.receiver_model.parameters()).dtype
+        hooks = []
+        for i in range(self.receiver_model.config.num_hidden_layers):
             attn = self.receiver_model.model.layers[i].self_attn
-            new_k = fused_kv.key_cache[i].to(dtype=model_dtype)
-            new_v = fused_kv.value_cache[i].to(dtype=model_dtype)
             try:
-                orig = RosettaModel._monkeypatch_qwen3_attention_forward(attn, new_k, new_v)
-                hook_handlers.append((attn, orig))
+                orig = RosettaModel._monkeypatch_qwen3_attention_forward(
+                    attn, fused.key_cache[i].to(dtype=mdtype),
+                    fused.value_cache[i].to(dtype=mdtype))
+                hooks.append((attn, orig))
             except Exception:
-                # If monkeypatching fails, skip (use baseline hidden states instead)
                 pass
 
-        if hook_handlers:
-            # Re-run with fused KV injected via monkeypatch
-            fused_out = self.receiver_model.forward(
-                input_ids=receiver_ids,
-                attention_mask=receiver_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                output_hidden_states=True,
-            )
-            fused_hidden = [h.detach() for h in fused_out.hidden_states]
-            del fused_out
-
-            # Restore original attention forwards
-            for attn, orig_forward in hook_handlers:
-                attn.forward = orig_forward
+        if hooks:
+            f_out = self.receiver_model(input_ids=r_ids, attention_mask=r_mask,
+                                        position_ids=pos, use_cache=True,
+                                        output_hidden_states=True)
+            hidden = [h.detach() for h in f_out.hidden_states]
+            fused_past = hybrid_to_dynamic(f_out.past_key_values)
+            last_logits = f_out.logits[:, -1, :]
+            del f_out
+            for attn, orig in hooks: attn.forward = orig
         else:
-            # Fallback: use baseline hidden states
-            fused_hidden = baseline_hidden
+            hidden = baseline
+            fused_past = r_kv
+            last_logits = r_out.logits[:, -1, :]
 
-        # ---- 6. Logit lens ----
-        logit_lens_results = self.logit_lens_decode(fused_hidden)
+        # 6) Logit lens
+        logit_lens_results = self.logit_lens_decode(hidden)
 
-        # Cleanup
-        del baseline_hidden, fused_hidden, receiver_out, receiver_kv, fused_kv
-        torch.cuda.empty_cache()
-        gc.collect()
+        # 7) Greedy auto-regressive generation from the fused state
+        max_new = self.model_config.get("generation_config", {}).get("max_new_tokens", 64)
+        eos_id = self.receiver_model.config.eos_token_id
+        if isinstance(eos_id, list):
+            eos_set = set(eos_id)
+        elif eos_id is not None:
+            eos_set = {eos_id}
+        else:
+            eos_set = set()
 
-        return logit_lens_results
+        gen_ids = []
+        cur_logits = last_logits
+        cur_past = fused_past
+        cur_mask = r_mask.clone()
 
-    # ------------------------------------------------------------------ #
-    #  Main analysis loop                                                 #
-    # ------------------------------------------------------------------ #
-    def run_analysis(self, output_dir: str, dataset_name: str = "mmlu-redux",
-                     num_tasks: Optional[int] = None,
+        for _ in range(max_new):
+            next_id = cur_logits.argmax(dim=-1)          # (B,)
+            token_id = next_id.item()
+            if token_id in eos_set:
+                break
+            gen_ids.append(token_id)
+
+            next_input = next_id.unsqueeze(1)             # (1, 1)
+            cur_mask = torch.cat([cur_mask,
+                torch.ones((1, 1), device=self.device, dtype=cur_mask.dtype)], dim=1)
+
+            step_out = self.receiver_model(
+                input_ids=next_input, attention_mask=cur_mask,
+                past_key_values=cur_past, use_cache=True)
+            cur_logits = step_out.logits[:, -1, :]
+            cur_past = step_out.past_key_values
+
+        generated_text = self.receiver_tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        del baseline, hidden, r_out, r_kv, fused, fused_past, cur_past
+        torch.cuda.empty_cache(); gc.collect()
+        return logit_lens_results, generated_text.strip()
+
+    # ---- main loop ----
+    def run_analysis(self, output_dir: str, num_tasks: Optional[int] = None,
                      subjects: Optional[List[str]] = None):
         os.makedirs(output_dir, exist_ok=True)
-        csv_path = os.path.join(output_dir, "receiver_sharer_dataset.csv")
+        csv_path  = os.path.join(output_dir, "receiver_sharer_dataset.csv")
+        jsonl_path = os.path.join(output_dir, "receiver_sharer_answers.jsonl")
 
         header = ["task#", "layer"]
-        for rank in range(1, 6):
-            header.extend([f"top{rank}", f"top{rank}_logit"])
+        for r in range(1, 6):
+            header += [f"top{r}", f"top{r}_logit"]
 
-        ds_cfg = {
-            "dataset_name": "edinburgh-dawg/mmlu-redux-2.0",
-            "test_split": "test",
-        }
+        ds_name = self.dataset_name
+        ds_cfg  = DATASET_CONFIGS[ds_name]
 
-        all_subjects = subjects or [
-            'abstract_algebra', 'anatomy', 'astronomy', 'business_ethics',
-            'clinical_knowledge', 'college_biology', 'college_chemistry',
-            'college_computer_science', 'college_mathematics', 'college_medicine',
-            'college_physics', 'computer_security', 'conceptual_physics',
-            'econometrics', 'electrical_engineering', 'elementary_mathematics',
-        ]
+        cfg_subjects = self.eval_config.get("subjects", None)
+        all_subjects = subjects or cfg_subjects or ds_cfg["subjects"]
 
         task_counter = 0
         rows = []
+        answer_records = []   # for JSONL
 
         for subject in all_subjects:
-            print(f"\n=== Processing subject: {subject} ===")
+            print(f"\n=== {ds_name} / {subject} ===")
             try:
-                dataset = load_dataset(ds_cfg["dataset_name"], subject)
-                test_data = dataset[ds_cfg["test_split"]]
+                if ds_name in ("math-500",):
+                    dataset = load_dataset(ds_cfg["hf_name"])
+                elif ds_name == "gsm8k":
+                    dataset = load_dataset(ds_cfg["hf_name"], "main")
+                elif ds_name == "openbookqa":
+                    dataset = load_dataset(ds_cfg["hf_name"])
+                elif ds_name == "ai2-arc":
+                    dataset = load_dataset(ds_cfg["hf_name"], "ARC-Challenge")
+                elif ds_name == "mmlu-pro":
+                    dataset = load_dataset(ds_cfg["hf_name"])
+                else:
+                    dataset = load_dataset(ds_cfg["hf_name"], subject)
+                test_data = dataset[ds_cfg["split"]]
             except Exception as e:
-                print(f"Failed to load {subject}: {e}")
-                continue
+                print(f"  Failed to load: {e}"); continue
 
-            sample_interval = self.eval_config.get("sample_interval", 1)
-            start_index = self.eval_config.get("start_index", 0)
-            indices = list(range(start_index, len(test_data), sample_interval))
+            interval = self.eval_config.get("sample_interval", 1)
+            start    = self.eval_config.get("start_index", 0)
+            indices  = list(range(start, len(test_data), interval))
 
             if num_tasks is not None:
-                remaining = num_tasks - task_counter
-                if remaining <= 0:
-                    break
-                indices = indices[:remaining]
+                rem = num_tasks - task_counter
+                if rem <= 0: break
+                indices = indices[:rem]
 
-            for idx in tqdm(indices, desc=f"{subject}"):
+            for idx in tqdm(indices, desc=f"  {subject}"):
                 try:
                     example = test_data[idx]
-                    error_type = example.get('error_type', '')
-                    if error_type in ['no_correct_answer', 'expert']:
+                    prompt = format_example(ds_name, example, self.use_cot, subject)
+                    if prompt is None:
                         continue
 
-                    choices = ""
-                    for ci, choice in enumerate(example['choices']):
-                        choices += f"{chr(65+ci)}. {choice}\n"
-                    prompt = build_prompt(example['question'], choices)
+                    # Ground truth
+                    gt = get_ground_truth(ds_name, example, subject)
 
-                    results = self.run_single_task(prompt, task_counter)
+                    # Run logit lens + generation
+                    logit_lens, gen_text = self.run_single_task(prompt, task_counter)
 
-                    for layer_idx, layer_top5 in enumerate(results):
-                        row = {"task#": task_counter, "layer": layer_idx}
-                        for rank, (token, logit) in enumerate(layer_top5, 1):
-                            token_clean = repr(token)[1:-1]  # safe repr
-                            row[f"top{rank}"] = token_clean
-                            row[f"top{rank}_logit"] = f"{logit:.3f}"
+                    # Extract prediction and judge
+                    pred = extract_prediction(ds_name, gen_text)
+                    correct = judge_correct(ds_name, pred, gt)
+
+                    # ---- CSV rows (logit lens) ----
+                    for li, top5 in enumerate(logit_lens):
+                        row = {"task#": task_counter, "layer": li}
+                        for rk, (tok, logit) in enumerate(top5, 1):
+                            row[f"top{rk}"] = repr(tok)[1:-1]
+                            row[f"top{rk}_logit"] = f"{logit:.3f}"
                         rows.append(row)
+
+                    # ---- JSONL record (answer) ----
+                    answer_records.append({
+                        "task_id": task_counter,
+                        "dataset": ds_name,
+                        "subject": subject,
+                        "example_index": idx,
+                        "prompt": prompt,
+                        "generated_text": gen_text,
+                        "prediction": pred,
+                        "ground_truth": gt,
+                        "correct": correct,
+                    })
 
                     task_counter += 1
                     if task_counter % 10 == 0:
-                        print(f"[Task {task_counter}] GPU: {get_memory_usage_gb():.2f} GB")
-
+                        print(f"  [Task {task_counter}] GPU: {gpu_gb():.2f} GB")
                 except Exception as e:
-                    print(f"Error on task {task_counter}, subject {subject}, idx {idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"  Error task {task_counter}, idx {idx}: {e}")
+                    import traceback; traceback.print_exc()
                     continue
 
+        # ---- Write CSV (logit lens) ----
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=header)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
+            w = csv.DictWriter(f, fieldnames=header); w.writeheader()
+            for row in rows: w.writerow(row)
+        print(f"\n✓ Logit lens: {len(rows)} rows ({task_counter} tasks) → {csv_path}")
 
-        print(f"\n✓ Saved {len(rows)} rows ({task_counter} tasks) to {csv_path}")
-        return csv_path
+        # ---- Write JSONL (answers) ----
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
+            for rec in answer_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        n_correct = sum(1 for r in answer_records if r["correct"] is True)
+        n_judged  = sum(1 for r in answer_records if r["correct"] is not None)
+        acc = n_correct / n_judged * 100 if n_judged > 0 else 0.0
+        print(f"✓ Answers: {len(answer_records)} tasks → {jsonl_path}")
+        print(f"  Accuracy: {n_correct}/{n_judged} = {acc:.2f}%")
 
+        return csv_path, jsonl_path
+
+
+# ===================================================================== #
+#  Main                                                                  #
+# ===================================================================== #
 
 def main():
     parser = argparse.ArgumentParser(description='Logit Lens Analysis')
@@ -514,36 +807,29 @@ def main():
     parser.add_argument("--num_tasks", type=int, default=None)
     parser.add_argument("--subjects", type=str, nargs="*", default=None)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--dataset", type=str, default="mmlu-redux")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    if args.output_dir:
-        output_dir = args.output_dir
-    else:
-        ckpt = config["model"]["rosetta_config"]["checkpoints_dir"]
-        output_dir = os.path.join(os.path.dirname(os.path.dirname(ckpt)), "resource")
-
+    output_dir = args.output_dir or os.path.join(
+        os.path.dirname(os.path.dirname(
+            config["model"]["rosetta_config"]["checkpoints_dir"])), "resource")
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Output: {output_dir}")
 
     device = torch.device(f"cuda:{args.gpu}")
     torch.cuda.set_device(device)
 
-    if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-        print(f"GPU {args.gpu}: {total:.1f} GB total, budget 49 GB")
+    ds_name = config["eval"].get("dataset", "mmlu-redux")
+    use_cot = config["eval"].get("use_cot", False)
+    print(f"Dataset: {ds_name}  |  CoT: {use_cot}  |  Output: {output_dir}")
+
+    # num_tasks: CLI > yaml > None (전체)
+    num_tasks = args.num_tasks if args.num_tasks is not None \
+        else config["eval"].get("num_of_tasks", None)
 
     analyzer = LogitLensAnalyzer(config, device)
     analyzer.load_models()
-    csv_path = analyzer.run_analysis(
-        output_dir=output_dir,
-        dataset_name=args.dataset,
-        num_tasks=args.num_tasks,
-        subjects=args.subjects,
-    )
-    print(f"\nDone. Results: {csv_path}")
+    analyzer.run_analysis(output_dir, num_tasks=num_tasks, subjects=args.subjects)
 
 
 if __name__ == "__main__":
