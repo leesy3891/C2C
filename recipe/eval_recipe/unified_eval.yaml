@@ -15,7 +15,7 @@ model:
   # background_prompt: "In one clear sentence, describe the most essential background knowledge needed to answer the question: {question}"
 
   generation_config:
-    do_sample: false
+    do_sample: true
     max_new_tokens: 64
     temperature: 0.7
     top_p: 0.8
