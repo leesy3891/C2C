@@ -17,19 +17,19 @@ model:
   generation_config:
     do_sample: false
     max_new_tokens: 64
-    # temperature: 0.7
-    # top_p: 0.8
-    # top_k: 20
-    # min_p: 0.05
-    # repetition_penalty: 1.0
-    # presence_penalty: 1.5
-    # frequency_penalty: 1.0
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.05
+    repetition_penalty: 1.0
+    presence_penalty: 1.5
+    frequency_penalty: 1.0
 
 output:
   output_dir: local/final_results/qwen3_8b+qwen2.5_7b_Fuser
 
 eval:
-  dataset: mmlu-redux
+  dataset: gpqa
 
   # gpu_ids are interpreted relative to CUDA_VISIBLE_DEVICES.
   # Example: CUDA_VISIBLE_DEVICES=3 + gpu_ids: [0] => physical GPU 3.
